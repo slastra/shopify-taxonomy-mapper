@@ -79,13 +79,9 @@ StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=taxonomy-mapper
 
-# Security hardening
+# Security hardening (relaxed for Bun compatibility)
 NoNewPrivileges=true
 PrivateTmp=true
-ProtectSystem=strict
-ProtectHome=read-only
-ReadWritePaths=$PROJECT_DIR/data
-ReadWritePaths=$PROJECT_DIR/logs
 
 [Install]
 WantedBy=multi-user.target

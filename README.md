@@ -368,7 +368,7 @@ sudo systemctl stop shopify-taxonomy-mapper
 - Auto-restart on crashes (10s delay, max 3 attempts/minute)
 - Memory limit: 1GB
 - CPU limit: 100%
-- Security hardening (read-only filesystem, private tmp)
+- Basic security hardening (private tmp, no new privileges)
 - Integrated with systemd journal for logging
 - Auto-start on system boot
 

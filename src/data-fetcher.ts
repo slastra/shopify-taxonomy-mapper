@@ -1,5 +1,5 @@
-import { writeFile, readFile, exists } from 'fs/promises';
-import { join } from 'path';
+import { writeFile, readFile, exists, mkdir } from 'fs/promises';
+import { join, dirname } from 'path';
 
 const GITHUB_REPO = 'Shopify/product-taxonomy';
 const GITHUB_BRANCH = 'main';
@@ -47,8 +47,13 @@ export class DataFetcher {
         // Download if we don't have it or if version is different
         if (!localVersion || localVersion !== remoteVersion) {
           console.log(`Downloading taxonomy data (${remoteVersion})...`);
-          await this.downloadTaxonomyData();
-          console.log('✓ Taxonomy data downloaded successfully');
+          try {
+            await this.downloadTaxonomyData();
+            console.log('✓ Taxonomy data downloaded successfully');
+          } catch (downloadError) {
+            console.error('Download failed:', downloadError instanceof Error ? downloadError.message : String(downloadError));
+            throw downloadError;
+          }
           return;
         } else {
           console.log('✓ Local taxonomy is up-to-date');
@@ -139,6 +144,9 @@ export class DataFetcher {
       if (!parsed.version) {
         throw new Error('Downloaded data missing version field');
       }
+
+      // Ensure data directory exists
+      await mkdir(dirname(LOCAL_DATA_PATH), { recursive: true });
 
       // Write to local file
       await writeFile(LOCAL_DATA_PATH, data, 'utf-8');
