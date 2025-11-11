@@ -23,6 +23,7 @@ export interface ToolCall {
 export interface NovaResponse {
   text?: string;
   toolCalls?: ToolCall[];
+  structuredOutput?: Record<string, unknown>;
   stopReason: string;
   usage: {
     inputTokens: number;
@@ -66,6 +67,7 @@ export class NovaLiteClient {
     userMessage: string,
     tools?: BedrockTool[],
     systemPrompt?: string,
+    jsonSchema?: Record<string, unknown>,
   ): Promise<NovaResponse> {
     // Add user message to history
     this.conversationHistory.push({
@@ -78,21 +80,34 @@ export class NovaLiteClient {
       ? { tools }
       : undefined;
 
-    // Prepare system prompts
-    const system = systemPrompt
-      ? [{ text: systemPrompt }]
-      : undefined;
+    // Prepare system prompts with optional JSON schema
+    let systemPrompts = systemPrompt ? [{ text: systemPrompt }] : undefined;
 
-    const command = new ConverseCommand({
+    // If JSON schema provided, add it to system prompt
+    if (jsonSchema) {
+      const schemaText = `You must respond with valid JSON matching this schema:\n${JSON.stringify(jsonSchema, null, 2)}`;
+      systemPrompts = systemPrompts
+        ? [...systemPrompts, { text: schemaText }]
+        : [{ text: schemaText }];
+    }
+
+    const commandParams: any = {
       modelId: this.modelId,
       messages: this.conversationHistory,
-      system,
+      system: systemPrompts,
       toolConfig,
       inferenceConfig: {
         maxTokens: 512,   // Nova Micro optimized for tool use
         temperature: 0.2, // Low temperature for deterministic tool use
       },
-    });
+    };
+
+    // Add structured output configuration if schema provided
+    if (jsonSchema) {
+      commandParams.additionalModelResponseFieldPaths = ['/output'];
+    }
+
+    const command = new ConverseCommand(commandParams);
 
     const response = await this.client.send(command);
 
@@ -121,6 +136,16 @@ export class NovaLiteClient {
       for (const content of outputMessage.content) {
         if ('text' in content && content.text) {
           result.text = content.text;
+
+          // If JSON schema was provided, try to parse structured JSON from text
+          if (jsonSchema && content.text) {
+            try {
+              const parsed = JSON.parse(content.text);
+              result.structuredOutput = parsed;
+            } catch {
+              // Not JSON, keep as text
+            }
+          }
         }
         if ('toolUse' in content && content.toolUse) {
           if (!result.toolCalls) result.toolCalls = [];

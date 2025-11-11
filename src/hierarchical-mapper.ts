@@ -187,7 +187,7 @@ export class HierarchicalMapper {
   }
 
   /**
-   * Ask Nova to select one option from a list
+   * Ask Nova to select one option from a list using JSON schema structured output
    */
   private async askForSelection(
     query: string,
@@ -196,7 +196,20 @@ export class HierarchicalMapper {
   ): Promise<string> {
     const turnStartTime = Date.now();
 
-    // Format options with leaf indicators
+    // Build JSON schema with enum of exact category names
+    const schema = {
+      type: 'object',
+      properties: {
+        category: {
+          type: 'string',
+          enum: options.map(o => o.name),
+          description: `The best matching category from the available ${levelDescription} options`,
+        },
+      },
+      required: ['category'],
+    };
+
+    // Format options with leaf indicators for context
     const optionsList = options
       .map((o, i) => `${i + 1}. ${o.name}${o.isLeaf ? ' ← LEAF' : ''}`)
       .join('\n');
@@ -206,49 +219,21 @@ export class HierarchicalMapper {
 Available ${levelDescription} options (${options.length} total):
 ${optionsList}
 
-CRITICAL INSTRUCTIONS:
-1. You MUST pick ONE option from the numbered list above
-2. Return ONLY the exact category name (not the number, not "← LEAF")
-3. Do NOT make up category names - only use the options shown
-4. If the query is generic, pick the most common/general option from the list
+Select the BEST matching category for "${query}" from the available options.`;
 
-Example: If the options include "3. Dog Food ← LEAF", return exactly: Dog Food
-
-Pick the BEST match for "${query}":`;
-
-    const response = await this.nova.converse(prompt);
+    const response = await this.nova.converse(prompt, undefined, undefined, schema);
 
     const turnTime = Date.now() - turnStartTime;
     console.log(`    └─ Turn complete: ${turnTime}ms`);
 
-    if (!response.text) {
-      throw new Error('Nova did not return a text response');
+    // Extract from structured output - guaranteed to be valid enum value
+    if (!response.structuredOutput || !('category' in response.structuredOutput)) {
+      throw new Error('No structured response received from Nova');
     }
 
-    // Clean up response - remove numbers, "← LEAF", quotes, etc.
-    let selected = response.text.trim();
-    selected = selected.replace(/^\d+\.\s*/, ''); // Remove "1. " prefix
-    selected = selected.replace(/\s*←\s*LEAF\s*$/i, ''); // Remove " ← LEAF" suffix
-    selected = selected.replace(/^["']|["']$/g, ''); // Remove quotes
-    selected = selected.trim(); // Trim again after cleanup
+    const selectedCategory = response.structuredOutput.category as string;
+    console.log(`    └─ LLM selected: "${selectedCategory}"`);
 
-    console.log(`    └─ LLM returned: "${selected}"`);
-
-    // Try exact match first
-    const exactMatch = options.find(o => o.name === selected);
-    if (exactMatch) {
-      return exactMatch.name;
-    }
-
-    // Try case-insensitive match
-    const caseInsensitiveMatch = options.find(o => o.name.toLowerCase() === selected.toLowerCase());
-    if (caseInsensitiveMatch) {
-      console.log(`    └─ Used case-insensitive match: "${caseInsensitiveMatch.name}"`);
-      return caseInsensitiveMatch.name;
-    }
-
-    // If no match found, log available options and throw error
-    console.error(`    └─ Available options: ${options.map(o => `"${o.name}"`).join(', ')}`);
-    throw new Error(`Could not find category: "${selected}"`);
+    return selectedCategory;
   }
 }
