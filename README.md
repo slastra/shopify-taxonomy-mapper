@@ -121,6 +121,7 @@ Map an Amazon category path to Shopify taxonomy.
 ```bash
 curl -X POST http://localhost:3001/api/map-category \
   -H "Content-Type: application/json" \
+  -H "Authorization: Bearer YOUR_ACCESS_TOKEN" \
   -d '{"amazon_category": "Pet Supplies > Dogs > Food"}'
 ```
 
@@ -153,6 +154,7 @@ Map a product title to Shopify taxonomy.
 ```bash
 curl -X POST http://localhost:3001/api/map-product \
   -H "Content-Type: application/json" \
+  -H "Authorization: Bearer YOUR_ACCESS_TOKEN" \
   -d '{"product_title": "Stainless Steel Dog Bowl"}'
 ```
 
@@ -340,6 +342,7 @@ Required:
 - `AMAZON-KEY`: AWS access key ID
 - `AMAZON-SECRET`: AWS secret access key
 - `AWS_REGION`: AWS region (default: us-east-1)
+- `API_ACCESS_TOKEN`: Access token for API authentication (generate with `openssl rand -hex 32`)
 
 Optional:
 - `NOVA_MODEL_ID`: Nova model to use (default: us.amazon.nova-micro-v1:0)

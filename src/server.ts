@@ -36,6 +36,23 @@ console.log(`✓ Using Nova model: ${mapper.getModelId()}`);
 // Get port from environment or use default
 const port = Number(process.env.HTTP_PORT || 3001);
 
+// Get API access token from environment
+const API_ACCESS_TOKEN = process.env.API_ACCESS_TOKEN;
+if (!API_ACCESS_TOKEN) {
+  console.error('ERROR: API_ACCESS_TOKEN environment variable is required');
+  process.exit(1);
+}
+console.log('✓ API access token configured');
+
+// Helper function to validate access token
+function validateToken(req: Request): boolean {
+  const authHeader = req.headers.get('Authorization');
+  if (!authHeader) return false;
+
+  const token = authHeader.replace('Bearer ', '');
+  return token === API_ACCESS_TOKEN;
+}
+
 // Start HTTP server
 Bun.serve({
   port,
@@ -46,7 +63,7 @@ Bun.serve({
     const corsHeaders = {
       'Access-Control-Allow-Origin': '*',
       'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-      'Access-Control-Allow-Headers': 'Content-Type',
+      'Access-Control-Allow-Headers': 'Content-Type, Authorization',
     };
 
     // Handle preflight requests
@@ -72,6 +89,14 @@ Bun.serve({
 
     // Map Amazon category path endpoint
     if (url.pathname === '/api/map-category' && req.method === 'POST') {
+      // Validate access token
+      if (!validateToken(req)) {
+        return Response.json(
+          { error: 'Unauthorized - valid access token required' },
+          { status: 401, headers: corsHeaders },
+        );
+      }
+
       try {
         const body = await req.json() as { amazon_category?: string };
 
@@ -108,6 +133,14 @@ Bun.serve({
 
     // Map product title endpoint
     if (url.pathname === '/api/map-product' && req.method === 'POST') {
+      // Validate access token
+      if (!validateToken(req)) {
+        return Response.json(
+          { error: 'Unauthorized - valid access token required' },
+          { status: 401, headers: corsHeaders },
+        );
+      }
+
       try {
         const body = await req.json() as { product_title?: string };
 
