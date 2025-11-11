@@ -336,6 +336,42 @@ EXPOSE 3001
 CMD ["bun", "start"]
 ```
 
+### Systemd Service (Production)
+
+The project includes an automated installer for systemd service deployment:
+
+```bash
+# Install and configure the systemd service
+sudo ./install-service.sh
+
+# Start the service
+sudo systemctl start shopify-taxonomy-mapper
+
+# Check status
+sudo systemctl status shopify-taxonomy-mapper
+
+# View logs (follow mode)
+sudo journalctl -u shopify-taxonomy-mapper -f
+
+# View logs (last 100 lines)
+sudo journalctl -u shopify-taxonomy-mapper -n 100
+
+# Restart the service
+sudo systemctl restart shopify-taxonomy-mapper
+
+# Stop the service
+sudo systemctl stop shopify-taxonomy-mapper
+```
+
+**Features:**
+- Auto-detects deployment directory and user
+- Auto-restart on crashes (10s delay, max 3 attempts/minute)
+- Memory limit: 1GB
+- CPU limit: 100%
+- Security hardening (read-only filesystem, private tmp)
+- Integrated with systemd journal for logging
+- Auto-start on system boot
+
 ### Environment Variables
 
 Required:
