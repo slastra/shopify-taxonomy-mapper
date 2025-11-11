@@ -34,7 +34,7 @@ export class DataFetcher {
           const parsed = JSON.parse(localData) as TaxonomyData;
           localVersion = parsed.version;
           console.log(`✓ Local taxonomy found (version ${localVersion})`);
-        } catch (error) {
+        } catch {
           console.warn('⚠ Local taxonomy file corrupted, will re-download');
         }
       }
@@ -65,7 +65,7 @@ export class DataFetcher {
           throw new Error(
             'Taxonomy data not available: GitHub is unreachable and no cached version exists. ' +
             'Please check your internet connection or manually download categories.json from: ' +
-            `https://github.com/${GITHUB_REPO}/blob/${GITHUB_BRANCH}/${DATA_FILE_PATH}`
+            `https://github.com/${GITHUB_REPO}/blob/${GITHUB_BRANCH}/${DATA_FILE_PATH}`,
           );
         }
       }
@@ -158,7 +158,7 @@ export class DataFetcher {
       const data = await readFile(LOCAL_DATA_PATH, 'utf-8');
       const parsed = JSON.parse(data) as TaxonomyData;
       return parsed.version || null;
-    } catch (error) {
+    } catch {
       return null;
     }
   }
