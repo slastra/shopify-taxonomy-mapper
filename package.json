@@ -9,8 +9,7 @@
     "watch": "tsc --watch",
     "dev": "bun run build && bun --watch src/server.ts",
     "start": "bun run build && bun src/server.ts",
-    "lint": "eslint src --ext .ts",
-    "lint:fix": "eslint src --ext .ts --fix",
+    "lint": "eslint src --ext .ts --fix",
     "type-check": "tsc --noEmit"
   },
   "keywords": [

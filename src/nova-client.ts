@@ -5,7 +5,10 @@ import {
   ToolConfiguration,
   Message,
   ContentBlock,
+  type ConverseCommandInput,
+  type ToolInputSchema,
 } from '@aws-sdk/client-bedrock-runtime';
+import type { DocumentType } from '@smithy/types';
 
 export interface NovaConfig {
   region?: string;
@@ -61,7 +64,10 @@ export class NovaLiteClient {
   }
 
   /**
-   * Send a message to Nova Micro
+   * Send a message to Nova using Tool Use for structured output
+   *
+   * When jsonSchema is provided, we define a tool with that schema and force
+   * the model to "call" it, guaranteeing structured output that matches the schema.
    */
   async converse(
     userMessage: string,
@@ -75,37 +81,49 @@ export class NovaLiteClient {
       content: [{ text: userMessage }],
     });
 
-    // Prepare tool configuration if tools provided
-    const toolConfig: ToolConfiguration | undefined = tools
-      ? { tools }
-      : undefined;
+    // Prepare system prompts
+    const systemPrompts = systemPrompt ? [{ text: systemPrompt }] : undefined;
 
-    // Prepare system prompts with optional JSON schema
-    let systemPrompts = systemPrompt ? [{ text: systemPrompt }] : undefined;
+    // Build tool configuration
+    let toolConfig: ToolConfiguration | undefined;
 
-    // If JSON schema provided, add it to system prompt
     if (jsonSchema) {
-      const schemaText = `You must respond with valid JSON matching this schema:\n${JSON.stringify(jsonSchema, null, 2)}`;
-      systemPrompts = systemPrompts
-        ? [...systemPrompts, { text: schemaText }]
-        : [{ text: schemaText }];
+      // Use Tool Use for structured output - define a tool with the schema
+      // The model will "call" this tool with input matching the schema
+      const inputSchema: ToolInputSchema = {
+        json: jsonSchema as DocumentType,
+      };
+      const structuredOutputTool: BedrockTool = {
+        toolSpec: {
+          name: 'submit_selection',
+          description: 'Submit the selected category and confidence level. You MUST call this tool with your selection.',
+          inputSchema,
+        },
+      };
+
+      // Combine with any other tools provided
+      const allTools = tools ? [...tools, structuredOutputTool] : [structuredOutputTool];
+      toolConfig = {
+        tools: allTools,
+        toolChoice: {
+          tool: { name: 'submit_selection' }, // Force the model to use this specific tool
+        },
+      };
+    } else if (tools) {
+      toolConfig = { tools };
     }
 
-    const commandParams: any = {
+    const commandParams: ConverseCommandInput = {
       modelId: this.modelId,
       messages: this.conversationHistory,
       system: systemPrompts,
       toolConfig,
       inferenceConfig: {
-        maxTokens: 512,   // Nova Micro optimized for tool use
-        temperature: 0.2, // Low temperature for deterministic tool use
+        maxTokens: 512,
+        temperature: 0.3,
+        topP: 0.9,
       },
     };
-
-    // Add structured output configuration if schema provided
-    if (jsonSchema) {
-      commandParams.additionalModelResponseFieldPaths = ['/output'];
-    }
 
     const command = new ConverseCommand(commandParams);
 
@@ -136,25 +154,24 @@ export class NovaLiteClient {
       for (const content of outputMessage.content) {
         if ('text' in content && content.text) {
           result.text = content.text;
-
-          // If JSON schema was provided, try to parse structured JSON from text
-          if (jsonSchema && content.text) {
-            try {
-              const parsed = JSON.parse(content.text);
-              result.structuredOutput = parsed;
-            } catch {
-              // Not JSON, keep as text
-            }
-          }
         }
         if ('toolUse' in content && content.toolUse) {
           if (!result.toolCalls) result.toolCalls = [];
           const input = content.toolUse.input;
+          const toolInput = (typeof input === 'object' && input !== null && !Array.isArray(input))
+            ? input as Record<string, unknown>
+            : {};
+
           result.toolCalls.push({
             toolUseId: content.toolUse.toolUseId || '',
             name: content.toolUse.name || '',
-            input: (typeof input === 'object' && input !== null && !Array.isArray(input)) ? input as Record<string, unknown> : {},
+            input: toolInput,
           });
+
+          // If this is our structured output tool, extract as structuredOutput
+          if (content.toolUse.name === 'submit_selection') {
+            result.structuredOutput = toolInput;
+          }
         }
       }
     }
@@ -200,8 +217,9 @@ export class NovaLiteClient {
       system,
       toolConfig,
       inferenceConfig: {
-        maxTokens: 512,   // Nova Micro optimized for tool use
-        temperature: 0.2, // Low temperature for deterministic tool use
+        maxTokens: 512,   // Sufficient for JSON response with confidence
+        temperature: 0.3, // Slightly higher for semantic flexibility
+        topP: 0.9,        // Better token diversity
       },
     });
 

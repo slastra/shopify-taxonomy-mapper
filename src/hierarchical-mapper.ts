@@ -2,6 +2,19 @@ import { NovaLiteClient } from './nova-client.js';
 import { TaxonomyLoader } from './taxonomy-loader.js';
 import { MappingCache } from './database.js';
 
+/**
+ * System prompt with key disambiguation rules for Shopify's taxonomy
+ */
+const TAXONOMY_SYSTEM_PROMPT = `You categorize products into Shopify's taxonomy.
+
+Key rules for Shopify's taxonomy:
+- Kitchen appliances (mixers, blenders, pressure cookers, etc.) go under "Kitchen & Dining", NOT "Household Appliances"
+- "Household Appliances" is for laundry machines, vacuums, air purifiers - NOT kitchen items
+- Headphones and earbuds are "Audio Components", NOT "Audio Accessories"
+- "Audio Accessories" is for cases, cables, stands - not the audio devices themselves
+
+Select the category that best matches the product.`;
+
 export interface MappingResult {
   node_id: string;
   confidence: 'high' | 'medium' | 'low';
@@ -86,94 +99,291 @@ export class HierarchicalMapper {
   }
 
   /**
-   * Perform guided navigation through taxonomy without tool use
+   * Perform guided navigation through taxonomy with backtracking support
    */
   private async performGuidedNavigation(query: string): Promise<Omit<MappingResult, 'cached'>> {
     this.nova.resetConversation();
 
-    const path: string[] = [];
-    let currentCategoryId: string | null = null;
+    const MAX_BACKTRACKS = 5;
+    let backtrackCount = 0;
     let turnCount = 0;
 
-    // Turn 1: Select top-level vertical
-    console.log(`  [Turn ${++turnCount}] Selecting top-level vertical...`);
-    const verticals = this.taxonomy.getVerticals();
-    const verticalNames = verticals.map(v => v.name);
+    // Track minimum confidence across all turns
+    let minConfidence: 'high' | 'medium' | 'low' = 'high';
+    const updateMinConfidence = (conf: 'high' | 'medium' | 'low') => {
+      if (conf === 'low') {
+        minConfidence = 'low';
+      } else if (conf === 'medium' && minConfidence === 'high') {
+        minConfidence = 'medium';
+      }
+    };
 
-    const selectedVertical = await this.askForSelection(
+    // Navigation stack: each entry tracks the category and which children have been tried
+    interface NavState {
+      categoryId: string;
+      categoryName: string;
+      triedChildren: Set<string>;
+    }
+    const navStack: NavState[] = [];
+
+    // Track navigation path for context in prompts
+    const navigationPath: string[] = [];
+
+    // Start with verticals selection
+    const verticals = this.taxonomy.getVerticals();
+    const triedVerticals = new Set<string>();
+
+    // Select initial vertical - include child category names as hints
+    console.log(`  [Turn ${++turnCount}] Selecting top-level vertical...`);
+    const verticalResult = await this.askForSelection(
       query,
-      verticalNames.map(name => ({ name, isLeaf: false })),
-      'top-level category',
+      verticals.map(v => {
+        const children = v.rootCategory ? this.taxonomy.getChildren(v.rootCategory.id) : [];
+        return {
+          name: v.name,
+          isLeaf: false,
+          childNames: children.map(c => c.name),
+        };
+      }),
+      [],
     );
 
-    const vertical = verticals.find(v => v.name === selectedVertical);
+    const vertical = verticals.find(v => v.name === verticalResult.category);
     if (!vertical || !vertical.rootCategory) {
-      throw new Error(`Could not find vertical: ${selectedVertical}`);
+      throw new Error(`Could not find vertical: ${verticalResult.category}`);
     }
 
-    path.push(selectedVertical);
-    currentCategoryId = vertical.rootCategory.id;
-    console.log(`    └─ Selected: ${selectedVertical}`);
+    updateMinConfidence(verticalResult.confidence);
+    triedVerticals.add(verticalResult.category);
+    navigationPath.push(verticalResult.category);
+    console.log(`    └─ Selected: ${verticalResult.category}`);
 
-    // Turn 2+: Drill down until we reach a leaf
-    while (currentCategoryId) {
-      const category = this.taxonomy.getCategory(currentCategoryId);
-      if (!category) break;
+    // Push root category onto stack
+    navStack.push({
+      categoryId: vertical.rootCategory.id,
+      categoryName: verticalResult.category,
+      triedChildren: new Set(),
+    });
+
+    // Navigate until we reach a leaf
+    while (navStack.length > 0) {
+      const current = navStack[navStack.length - 1];
+      const category = this.taxonomy.getCategory(current.categoryId);
+      if (!category) {
+        navStack.pop();
+        continue;
+      }
 
       // If this is a leaf, we're done
       if (category.children.length === 0) {
+        // Use accumulated confidence, but downgrade if we had to backtrack
+        const finalConfidence = backtrackCount > 0 ? 'low' : minConfidence;
         return {
           node_id: category.id.replace('gid://shopify/TaxonomyCategory/', ''),
-          confidence: 'high',
-          reasoning: `Reached leaf category at level ${category.level}`,
+          confidence: finalConfidence,
+          reasoning: backtrackCount === 0
+            ? `Reached leaf category at level ${category.level}`
+            : `Reached leaf category at level ${category.level} after ${backtrackCount} backtrack(s)`,
           full_name: category.full_name,
           turns: turnCount,
         };
       }
 
-      // Get children and ask for selection
-      console.log(`  [Turn ${++turnCount}] Selecting from ${category.children.length} children...`);
-      const children = this.taxonomy.getChildren(currentCategoryId);
+      // Get available children (excluding already tried ones)
+      const allChildren = this.taxonomy.getChildren(current.categoryId);
+      const availableChildren = allChildren.filter(c => !current.triedChildren.has(c.name));
 
-      // Add "Other" option to allow stopping at parent category
-      const childOptions = children.map(c => ({
-        name: c.name,
-        isLeaf: c.children.length === 0,
-      }));
-      childOptions.push({
-        name: 'Other (use parent category)',
-        isLeaf: true,
+      // If no children left to try, we need to backtrack
+      if (availableChildren.length === 0) {
+        console.log(`  [Backtrack] No more options at "${category.name}", going back...`);
+        navStack.pop();
+        backtrackCount++;
+
+        if (backtrackCount > MAX_BACKTRACKS) {
+          // Use the deepest category we reached as fallback
+          const deepest = navStack.length > 0
+            ? this.taxonomy.getCategory(navStack[navStack.length - 1].categoryId)
+            : vertical.rootCategory;
+          if (deepest) {
+            return {
+              node_id: deepest.id.replace('gid://shopify/TaxonomyCategory/', ''),
+              confidence: 'low',
+              reasoning: `Max backtracks (${MAX_BACKTRACKS}) exceeded, using best available category`,
+              full_name: deepest.full_name,
+              turns: turnCount,
+            };
+          }
+        }
+
+        // If stack is empty, try a different vertical
+        if (navStack.length === 0) {
+          const availableVerticals = verticals.filter(v => !triedVerticals.has(v.name));
+          if (availableVerticals.length === 0) {
+            // All verticals exhausted, use the original one
+            return {
+              node_id: vertical.rootCategory.id.replace('gid://shopify/TaxonomyCategory/', ''),
+              confidence: 'low',
+              reasoning: 'All navigation paths exhausted, using root category',
+              full_name: vertical.rootCategory.full_name,
+              turns: turnCount,
+            };
+          }
+
+          console.log(`  [Turn ${++turnCount}] Re-selecting top-level vertical (excluding tried)...`);
+          const newVerticalResult = await this.askForSelection(
+            query,
+            availableVerticals.map(v => {
+              const children = v.rootCategory ? this.taxonomy.getChildren(v.rootCategory.id) : [];
+              return {
+                name: v.name,
+                isLeaf: false,
+                childNames: children.map(c => c.name),
+              };
+            }),
+            [],
+          );
+
+          const newV = verticals.find(v => v.name === newVerticalResult.category);
+          if (!newV || !newV.rootCategory) {
+            throw new Error(`Could not find vertical: ${newVerticalResult.category}`);
+          }
+
+          updateMinConfidence(newVerticalResult.confidence);
+          triedVerticals.add(newVerticalResult.category);
+          navigationPath.length = 0; // Reset path
+          navigationPath.push(newVerticalResult.category);
+          console.log(`    └─ Selected: ${newVerticalResult.category}`);
+
+          navStack.push({
+            categoryId: newV.rootCategory.id,
+            categoryName: newVerticalResult.category,
+            triedChildren: new Set(),
+          });
+        }
+        continue;
+      }
+
+      // Ask for selection from available children
+      console.log(`  [Turn ${++turnCount}] Selecting from ${availableChildren.length} children of "${category.name}"...`);
+
+      const childOptions = availableChildren.map(c => {
+        const grandchildren = this.taxonomy.getChildren(c.id);
+        return {
+          name: c.name,
+          isLeaf: c.children.length === 0,
+          childNames: grandchildren.map(gc => gc.name),
+        };
       });
 
-      const selectedChild = await this.askForSelection(
+      // Add "None of these" option if we have somewhere to go back to
+      const canGoBack = navStack.length > 1 || triedVerticals.size < verticals.length;
+      if (canGoBack) {
+        childOptions.push({
+          name: 'None of these match',
+          isLeaf: false,
+          childNames: [],
+        });
+      }
+
+      const childResult = await this.askForSelection(
         query,
         childOptions,
-        'child category',
+        navigationPath,
       );
 
-      // Check if "Other" was selected (use parent category)
-      if (selectedChild === 'Other (use parent category)') {
-        console.log(`    └─ Selected: Other (using parent category "${category.name}")`);
-        return {
-          node_id: category.id.replace('gid://shopify/TaxonomyCategory/', ''),
-          confidence: 'medium',
-          reasoning: `Used parent category "${category.name}" - subcategories too specific`,
-          full_name: category.full_name,
-          turns: turnCount,
-        };
+      // Handle backtrack request
+      if (childResult.category === 'None of these match') {
+        // The category we're abandoning was already marked as "tried" on the parent
+        // when we first selected it, so just pop and continue
+        const abandonedCategory = navStack[navStack.length - 1];
+        console.log(`    └─ No match found, backtracking from "${abandonedCategory.categoryName}"...`);
+
+        navStack.pop();
+        navigationPath.pop();
+        backtrackCount++;
+
+        if (backtrackCount > MAX_BACKTRACKS) {
+          const deepest = navStack.length > 0
+            ? this.taxonomy.getCategory(navStack[navStack.length - 1].categoryId)
+            : vertical.rootCategory;
+          if (deepest) {
+            return {
+              node_id: deepest.id.replace('gid://shopify/TaxonomyCategory/', ''),
+              confidence: 'low',
+              reasoning: `Max backtracks (${MAX_BACKTRACKS}) exceeded, using best available category`,
+              full_name: deepest.full_name,
+              turns: turnCount,
+            };
+          }
+        }
+
+        // If stack is empty after backtrack, try a different vertical
+        if (navStack.length === 0) {
+          const availableVerticals = verticals.filter(v => !triedVerticals.has(v.name));
+          if (availableVerticals.length === 0) {
+            // All verticals exhausted, use the original one
+            return {
+              node_id: vertical.rootCategory.id.replace('gid://shopify/TaxonomyCategory/', ''),
+              confidence: 'low',
+              reasoning: 'All navigation paths exhausted, using root category',
+              full_name: vertical.rootCategory.full_name,
+              turns: turnCount,
+            };
+          }
+
+          console.log(`  [Turn ${++turnCount}] Re-selecting top-level vertical (excluding ${triedVerticals.size} tried)...`);
+          const newVerticalResult = await this.askForSelection(
+            query,
+            availableVerticals.map(v => {
+              const children = v.rootCategory ? this.taxonomy.getChildren(v.rootCategory.id) : [];
+              return {
+                name: v.name,
+                isLeaf: false,
+                childNames: children.map(c => c.name),
+              };
+            }),
+            [],
+          );
+
+          const newV = verticals.find(v => v.name === newVerticalResult.category);
+          if (!newV || !newV.rootCategory) {
+            throw new Error(`Could not find vertical: ${newVerticalResult.category}`);
+          }
+
+          updateMinConfidence(newVerticalResult.confidence);
+          triedVerticals.add(newVerticalResult.category);
+          navigationPath.length = 0; // Reset path
+          navigationPath.push(newVerticalResult.category);
+          console.log(`    └─ Selected: ${newVerticalResult.category}`);
+
+          navStack.push({
+            categoryId: newV.rootCategory.id,
+            categoryName: newVerticalResult.category,
+            triedChildren: new Set(),
+          });
+        }
+        continue;
       }
 
-      // askForSelection now returns the exact matched name, so this should always find it
-      const child = children.find(c => c.name === selectedChild);
+      updateMinConfidence(childResult.confidence);
+
+      // Find the selected child
+      const child = allChildren.find(c => c.name === childResult.category);
       if (!child) {
-        // This should never happen now, but keep as safety check
-        console.error(`    └─ Available children: ${children.map(c => `"${c.name}"`).join(', ')}`);
-        throw new Error(`Could not find child category: "${selectedChild}"`);
+        console.error(`    └─ Available children: ${availableChildren.map(c => `"${c.name}"`).join(', ')}`);
+        throw new Error(`Could not find child category: "${childResult.category}"`);
       }
 
-      path.push(child.name);
-      currentCategoryId = child.id;
+      // Mark this child as tried and push to stack
+      current.triedChildren.add(child.name);
+      navigationPath.push(child.name);
       console.log(`    └─ Selected: ${child.name}${child.children.length === 0 ? ' (LEAF)' : ''}`);
+
+      navStack.push({
+        categoryId: child.id,
+        categoryName: child.name,
+        triedChildren: new Set(),
+      });
     }
 
     throw new Error('Navigation ended without reaching a leaf category');
@@ -191,49 +401,90 @@ export class HierarchicalMapper {
    */
   private async askForSelection(
     query: string,
-    options: Array<{ name: string; isLeaf: boolean }>,
-    levelDescription: string,
-  ): Promise<string> {
+    options: Array<{ name: string; isLeaf: boolean; childNames?: string[] }>,
+    currentPath: string[],
+  ): Promise<{ category: string; confidence: 'high' | 'medium' | 'low' }> {
     const turnStartTime = Date.now();
 
-    // Build JSON schema with enum of exact category names
+    // Build JSON schema with enum of exact category names and confidence
     const schema = {
       type: 'object',
       properties: {
         category: {
           type: 'string',
           enum: options.map(o => o.name),
-          description: `The best matching category from the available ${levelDescription} options`,
+          description: 'The selected category (must exactly match one option)',
+        },
+        confidence: {
+          type: 'string',
+          enum: ['high', 'medium', 'low'],
+          description: 'How certain: high=clear match, medium=reasonable, low=uncertain',
         },
       },
-      required: ['category'],
+      required: ['category', 'confidence'],
     };
 
-    // Format options with leaf indicators for context
-    const optionsList = options
-      .map((o, i) => `${i + 1}. ${o.name}${o.isLeaf ? ' ← LEAF' : ''}`)
-      .join('\n');
+    // Build options list with child hints on separate lines
+    const optionsList = options.map((o, i) => {
+      if (o.isLeaf || !o.childNames || o.childNames.length === 0) {
+        return `${i + 1}. ${o.name}`;
+      }
+      // Show up to 5 children as hints on next line, indented
+      const childList = o.childNames.slice(0, 5).join(', ') + (o.childNames.length > 5 ? '...' : '');
+      return `${i + 1}. ${o.name}\n   → includes: ${childList}`;
+    }).join('\n');
 
-    const prompt = `You are mapping "${query}" to Shopify's product taxonomy.
+    // Build path context
+    const pathContext = currentPath.length > 0
+      ? `\nPath: ${currentPath.join(' > ')}`
+      : '';
 
-Available ${levelDescription} options (${options.length} total):
-${optionsList}
+    const prompt = `Product: "${query}"${pathContext}
 
-Select the BEST matching category for "${query}" from the available options.`;
+Which category? (Select from the numbered options, not the examples in parentheses)
+${optionsList}`;
 
-    const response = await this.nova.converse(prompt, undefined, undefined, schema);
+    // Reset conversation before each turn to avoid tool result requirements
+    // Each turn is stateless - we provide full context in the prompt
+    this.nova.resetConversation();
+
+    const response = await this.nova.converse(prompt, undefined, TAXONOMY_SYSTEM_PROMPT, schema);
 
     const turnTime = Date.now() - turnStartTime;
     console.log(`    └─ Turn complete: ${turnTime}ms`);
 
-    // Extract from structured output - guaranteed to be valid enum value
+    // Debug: log raw response
+    if (response.text) {
+      console.log(`    └─ Raw response: ${response.text.substring(0, 200)}`);
+    }
+
+    // Extract from structured output
     if (!response.structuredOutput || !('category' in response.structuredOutput)) {
+      console.error('    └─ No structured output. Response:', JSON.stringify(response, null, 2));
       throw new Error('No structured response received from Nova');
     }
 
     const selectedCategory = response.structuredOutput.category as string;
-    console.log(`    └─ LLM selected: "${selectedCategory}"`);
+    const confidence = (response.structuredOutput.confidence as 'high' | 'medium' | 'low') || 'medium';
+    console.log(`    └─ LLM selected: "${selectedCategory}" (confidence: ${confidence})`);
 
-    return selectedCategory;
+    // Validate that the selected category is actually in our options (enum not strictly enforced by models)
+    const validOptionNames = options.map(o => o.name);
+    if (!validOptionNames.includes(selectedCategory)) {
+      console.error(`    └─ ERROR: "${selectedCategory}" is not a valid option!`);
+      console.error(`    └─ Valid options: ${validOptionNames.join(', ')}`);
+
+      // Try to find if it matches a child hint (common error)
+      for (const opt of options) {
+        if (opt.childNames?.includes(selectedCategory)) {
+          console.log(`    └─ "${selectedCategory}" is a child of "${opt.name}", selecting parent instead`);
+          return { category: opt.name, confidence: 'medium' };
+        }
+      }
+
+      throw new Error(`Model returned invalid category "${selectedCategory}" not in options: ${validOptionNames.join(', ')}`);
+    }
+
+    return { category: selectedCategory, confidence };
   }
 }
