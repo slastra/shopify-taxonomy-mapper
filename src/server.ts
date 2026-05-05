@@ -4,23 +4,19 @@ import { TaxonomyLoader } from './taxonomy-loader.js';
 import { MappingCache } from './database.js';
 import { HierarchicalMapper } from './hierarchical-mapper.js';
 import { DataFetcher } from './data-fetcher.js';
+import { stripGid } from './ids.js';
+import { errMessage } from './errors.js';
 
-// Ensure taxonomy data is available (fetch from GitHub if needed)
 const dataFetcher = new DataFetcher();
 await dataFetcher.ensureTaxonomyData();
 
-// Initialize instances
 const taxonomy = new TaxonomyLoader();
-const cache = new MappingCache();
-let mapper: HierarchicalMapper;
-
-// Load taxonomy data at startup
 console.log('Loading Shopify taxonomy...');
 await taxonomy.load();
 console.log(`✓ Loaded Shopify taxonomy version ${taxonomy.getVersion()}`);
 console.log(`✓ Total categories: ${taxonomy.getTotalCategoryCount()}`);
 
-// Connect to SQLite database
+const cache = new MappingCache();
 try {
   cache.connect('./data/mappings.db');
   console.log('✓ Connected to mapping cache database (SQLite)');
@@ -28,15 +24,12 @@ try {
   console.error('Warning: Could not connect to database:', error);
 }
 
-// Initialize hierarchical mapper
-mapper = new HierarchicalMapper(taxonomy, cache);
+const mapper = new HierarchicalMapper(taxonomy, cache);
 console.log('✓ Hierarchical mapper initialized');
 console.log(`✓ Using Nova model: ${mapper.getModelId()}`);
 
-// Get port from environment or use default
 const port = Number(process.env.HTTP_PORT || 3001);
 
-// Get API access token from environment
 const API_ACCESS_TOKEN = process.env.API_ACCESS_TOKEN;
 if (!API_ACCESS_TOKEN) {
   console.error('ERROR: API_ACCESS_TOKEN environment variable is required');
@@ -44,227 +37,124 @@ if (!API_ACCESS_TOKEN) {
 }
 console.log('✓ API access token configured');
 
-// Helper function to validate access token
-function validateToken(req: Request): boolean {
-  const authHeader = req.headers.get('Authorization');
-  if (!authHeader) return false;
+const CORS_HEADERS = {
+  'Access-Control-Allow-Origin': '*',
+  'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+  'Access-Control-Allow-Headers': 'Content-Type, Authorization',
+};
 
-  const token = authHeader.replace('Bearer ', '');
-  return token === API_ACCESS_TOKEN;
+function json(body: unknown, status = 200): Response {
+  return Response.json(body, { status, headers: CORS_HEADERS });
 }
 
-// Start HTTP server
+function unauthorized(): Response {
+  return json({ error: 'Unauthorized - valid access token required' }, 401);
+}
+
+function badRequest(message: string): Response {
+  return json({ error: message }, 400);
+}
+
+function notFound(message = 'Not found'): Response {
+  return json({ error: message }, 404);
+}
+
+function requireToken(req: Request): Response | null {
+  const authHeader = req.headers.get('Authorization');
+  const token = authHeader?.replace('Bearer ', '');
+  return token === API_ACCESS_TOKEN ? null : unauthorized();
+}
+
+async function handle(label: string, fn: () => Promise<Response>): Promise<Response> {
+  try {
+    return await fn();
+  } catch (error) {
+    console.error(`Error ${label}:`, error);
+    return json({ error: 'Internal server error', message: errMessage(error) }, 500);
+  }
+}
+
 Bun.serve({
   port,
   async fetch(req) {
     const url = new URL(req.url);
 
-    // CORS headers
-    const corsHeaders = {
-      'Access-Control-Allow-Origin': '*',
-      'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-      'Access-Control-Allow-Headers': 'Content-Type, Authorization',
-    };
-
-    // Handle preflight requests
     if (req.method === 'OPTIONS') {
-      return new Response(null, {
-        status: 204,
-        headers: corsHeaders,
+      return new Response(null, { status: 204, headers: CORS_HEADERS });
+    }
+
+    if (url.pathname === '/health' && req.method === 'GET') {
+      return json({
+        status: 'ok',
+        taxonomy_version: taxonomy.getVersion(),
+        total_categories: taxonomy.getTotalCategoryCount(),
+        cache_stats: cache.getStats(),
       });
     }
 
-    // Health check endpoint
-    if (url.pathname === '/health' && req.method === 'GET') {
-      return Response.json(
-        {
-          status: 'ok',
-          taxonomy_version: taxonomy.getVersion(),
-          total_categories: taxonomy.getTotalCategoryCount(),
-          cache_stats: cache.getStats(),
-        },
-        { headers: corsHeaders },
-      );
-    }
-
-    // Map Amazon category path endpoint
     if (url.pathname === '/api/map-category' && req.method === 'POST') {
-      // Validate access token
-      if (!validateToken(req)) {
-        return Response.json(
-          { error: 'Unauthorized - valid access token required' },
-          { status: 401, headers: corsHeaders },
-        );
-      }
-
-      try {
+      return requireToken(req) ?? handle('mapping category', async () => {
         const body = await req.json() as { amazon_category?: string };
-
         if (!body.amazon_category || typeof body.amazon_category !== 'string') {
-          return Response.json(
-            { error: 'Missing or invalid "amazon_category" field' },
-            { status: 400, headers: corsHeaders },
-          );
+          return badRequest('Missing or invalid "amazon_category" field');
         }
-
-        const result = await mapper.mapCategory(body.amazon_category);
-
-        return Response.json(
-          {
-            node_id: result.node_id,
-            full_name: result.full_name,
-            confidence: result.confidence,
-            cached: result.cached,
-            turns: result.turns,
-          },
-          { headers: corsHeaders },
-        );
-      } catch (error) {
-        console.error('Error mapping category:', error);
-        return Response.json(
-          {
-            error: 'Internal server error',
-            message: error instanceof Error ? error.message : 'Unknown error',
-          },
-          { status: 500, headers: corsHeaders },
-        );
-      }
+        const r = await mapper.mapCategory(body.amazon_category);
+        return json({ node_id: r.node_id, full_name: r.full_name, confidence: r.confidence, cached: r.cached, turns: r.turns, unmapped: r.unmapped ?? false });
+      });
     }
 
-    // Map product title endpoint
     if (url.pathname === '/api/map-product' && req.method === 'POST') {
-      // Validate access token
-      if (!validateToken(req)) {
-        return Response.json(
-          { error: 'Unauthorized - valid access token required' },
-          { status: 401, headers: corsHeaders },
-        );
-      }
-
-      try {
+      return requireToken(req) ?? handle('mapping product', async () => {
         const body = await req.json() as { product_title?: string };
-
         if (!body.product_title || typeof body.product_title !== 'string') {
-          return Response.json(
-            { error: 'Missing or invalid "product_title" field' },
-            { status: 400, headers: corsHeaders },
-          );
+          return badRequest('Missing or invalid "product_title" field');
         }
-
-        const result = await mapper.mapProduct(body.product_title);
-
-        return Response.json(
-          {
-            node_id: result.node_id,
-            full_name: result.full_name,
-            confidence: result.confidence,
-            cached: result.cached,
-            turns: result.turns,
-          },
-          { headers: corsHeaders },
-        );
-      } catch (error) {
-        console.error('Error mapping product:', error);
-        return Response.json(
-          {
-            error: 'Internal server error',
-            message: error instanceof Error ? error.message : 'Unknown error',
-          },
-          { status: 500, headers: corsHeaders },
-        );
-      }
+        const r = await mapper.mapProduct(body.product_title);
+        return json({ node_id: r.node_id, full_name: r.full_name, confidence: r.confidence, cached: r.cached, turns: r.turns, unmapped: r.unmapped ?? false });
+      });
     }
 
-    // Search categories endpoint (utility)
     if (url.pathname === '/api/search' && req.method === 'GET') {
-      try {
+      return handle('searching categories', async () => {
         const query = url.searchParams.get('q');
         const limit = Number(url.searchParams.get('limit') || 10);
-
-        if (!query) {
-          return Response.json(
-            { error: 'Missing "q" query parameter' },
-            { status: 400, headers: corsHeaders },
-          );
-        }
+        if (!query) return badRequest('Missing "q" query parameter');
 
         const results = taxonomy.search(query, limit);
-
-        return Response.json(
-          {
-            results: results.map(r => ({
-              node_id: r.category.id.replace('gid://shopify/TaxonomyCategory/', ''),
-              name: r.category.name,
-              full_name: r.category.full_name,
-              level: r.category.level,
-            })),
-            count: results.length,
-          },
-          { headers: corsHeaders },
-        );
-      } catch (error) {
-        console.error('Error searching categories:', error);
-        return Response.json(
-          {
-            error: 'Internal server error',
-            message: error instanceof Error ? error.message : 'Unknown error',
-          },
-          { status: 500, headers: corsHeaders },
-        );
-      }
+        return json({
+          results: results.map(r => ({
+            node_id: stripGid(r.category.id),
+            name: r.category.name,
+            full_name: r.category.full_name,
+            level: r.category.level,
+          })),
+          count: results.length,
+        });
+      });
     }
 
-    // Get category by ID endpoint (utility)
     if (url.pathname.startsWith('/api/category/') && req.method === 'GET') {
-      try {
+      return handle('fetching category', async () => {
         const nodeId = url.pathname.replace('/api/category/', '');
-
-        if (!nodeId) {
-          return Response.json(
-            { error: 'Missing category ID' },
-            { status: 400, headers: corsHeaders },
-          );
-        }
+        if (!nodeId) return badRequest('Missing category ID');
 
         const category = taxonomy.getCategory(nodeId);
+        if (!category) return notFound('Category not found');
 
-        if (!category) {
-          return Response.json(
-            { error: 'Category not found' },
-            { status: 404, headers: corsHeaders },
-          );
-        }
-
-        return Response.json(
-          {
-            node_id: category.id.replace('gid://shopify/TaxonomyCategory/', ''),
-            gid: category.id,
-            name: category.name,
-            full_name: category.full_name,
-            level: category.level,
-            is_leaf: category.children.length === 0,
-            children_count: category.children.length,
-            parent_id: category.parent_id,
-          },
-          { headers: corsHeaders },
-        );
-      } catch (error) {
-        console.error('Error fetching category:', error);
-        return Response.json(
-          {
-            error: 'Internal server error',
-            message: error instanceof Error ? error.message : 'Unknown error',
-          },
-          { status: 500, headers: corsHeaders },
-        );
-      }
+        return json({
+          node_id: stripGid(category.id),
+          gid: category.id,
+          name: category.name,
+          full_name: category.full_name,
+          level: category.level,
+          is_leaf: category.children.length === 0,
+          children_count: category.children.length,
+          parent_id: category.parent_id,
+        });
+      });
     }
 
-    // 404 for unknown routes
-    return Response.json(
-      { error: 'Not found' },
-      { status: 404, headers: corsHeaders },
-    );
+    return notFound();
   },
 });
 

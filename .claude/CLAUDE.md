@@ -28,35 +28,35 @@ HTTP API service for mapping Amazon categories and product titles to Shopify's o
 
 ## Critical Patterns
 
-### JSON Schema Structured Output (MOST IMPORTANT)
+### Structured Output via Forced Tool Use (MOST IMPORTANT)
 
-**Always use JSON schema with enum constraints for category selection:**
+Bedrock Nova doesn't natively expose `response_format: json_schema`. We use the
+Converse API's tool-use mechanism with `toolChoice` set to force the model to
+"call" a synthetic tool whose input schema is our enum. The tool input becomes
+the structured output.
 
 ```typescript
-// Build schema with exact category names as enum
-const schema = {
-  type: 'object',
-  properties: {
-    category: {
-      type: 'string',
-      enum: options.map(o => o.name),  // Exact names only!
-      description: 'The best matching category',
-    },
+// nova-client.ts wires the schema as a tool with forced toolChoice:
+const tool = {
+  toolSpec: {
+    name: 'submit_selection',
+    description: 'Submit the selected category and confidence level.',
+    inputSchema: { json: jsonSchema },
   },
-  required: ['category'],
 };
-
-// Pass to Nova
-const response = await this.nova.converse(prompt, undefined, undefined, schema);
-
-// Extract from structured output (guaranteed valid)
-const selectedCategory = response.structuredOutput.category as string;
+const toolConfig = {
+  tools: [tool],
+  toolChoice: { tool: { name: 'submit_selection' } }, // forces the call
+};
+// Model's tool input is surfaced as response.structuredOutput
 ```
 
 **Why this matters:**
-- Without schema: LLM returns free-text ("Audio") that doesn't match ("Audio Equipment") → errors
-- With schema: LLM constrained to exact enum values → guaranteed match
-- See AWS Bedrock structured output docs: `additionalModelResponseFieldPaths`
+- Without forcing: model emits text like "Audio" that doesn't match "Audio Components" → errors
+- With forced tool use: model is constrained to call submit_selection with valid enum → guaranteed match
+- This is NOT `additionalModelResponseFieldPaths` — that field exists on Bedrock but Nova doesn't honor JSON-schema response formats. Tool use is the working path.
+
+**Validation guard at hierarchical-mapper.ts:** even with forced tool choice, models occasionally pick a child-hint name instead of one of the actual options. The mapper detects this and falls back to the parent option. Logged so you can see how often it fires.
 
 **Never:**
 - ❌ Parse free-text responses for category names
@@ -89,8 +89,9 @@ Token stored in `.env` (not committed). Generate with: `openssl rand -hex 32`
 - `API_ACCESS_TOKEN` - Bearer token for API auth
 
 **Optional:**
-- `NOVA_MODEL_ID` - Default: us.amazon.nova-micro-v1:0
-  - Options: nova-micro, nova-lite, nova-pro
+- `NOVA_MODEL_ID` - Default: us.amazon.nova-2-lite-v1:0
+  - Options: nova-2-lite, nova-micro, nova-lite, nova-pro
+  - The client also tolerates Anthropic Claude IDs (e.g. us.anthropic.claude-haiku-4-5-...) — it auto-drops `topP` for Claude since Bedrock rejects `temperature` + `topP` together.
 - `HTTP_PORT` - Default: 3001
 
 ### Nova Model Configuration
@@ -101,18 +102,40 @@ Model selected via `NOVA_MODEL_ID` environment variable:
 this.modelId = config.modelId || process.env.NOVA_MODEL_ID || 'us.amazon.nova-micro-v1:0';
 ```
 
-**Model characteristics:**
-- **Nova Micro** - Fastest, cheapest (~$0.003/mapping)
-- **Nova Lite** - Better accuracy, moderate cost
-- **Nova Pro** - Best accuracy, highest cost
+**Model characteristics (measured on 25-query eval, agreement vs Haiku 4.5):**
+| Model | Accuracy | Avg ms | $/mapping (no cache) | $/mapping (cached) |
+|---|---|---|---|---|
+| Nova Micro | 36% | 2972 | $0.00023 | — |
+| Nova Lite v1 | 72% | 3652 | $0.00040 | — |
+| **Nova 2 Lite (default)** | **80%** | 3869 | $0.00322 | **$0.00066** |
+| Nova Pro | 72% | 3938 | $0.00527 | — |
+| Claude Haiku 4.5 | 100% (gold) | 7281 | $0.01042 | — |
+
+Nova 2 Lite is the prod default — best accuracy in the Nova family, ~2x faster than Haiku 4.5, ~5x cheaper with caching enabled.
 
 **Inference config:**
 ```typescript
 inferenceConfig: {
-  maxTokens: 512,      // Optimized for tool use
-  temperature: 0.2,    // Low for deterministic selection
+  maxTokens: 512,      // Sufficient for JSON tool input
+  temperature: 0.3,    // Low for deterministic selection
+  topP: 0.9,           // Auto-dropped for Claude models
 }
 ```
+
+### Bedrock Prompt Caching
+
+Each turn's prompt is split into:
+- **Static cacheable prefix**: instructions + numbered options list (turn 1 = 26 verticals; drill-down = current parent's children). Identical across queries that hit the same option set, so it caches.
+- **Dynamic suffix**: the input query and current navigation path.
+
+A `cachePoint` marker is placed between them. Nova requires ≥1024 tokens before the marker — turn 1 (verticals + hints) clears this easily. Drill-down turns may not always hit the threshold, in which case the cache silently no-ops.
+
+**Verifying cache hits:**
+```bash
+bun run measure-cache  # runs 7 sequential mappings, reports cache reads/writes/cost
+```
+
+`NovaResponse.usage` exposes `cacheReadInputTokens` and `cacheWriteInputTokens`. With a warm cache, steady-state cost drops ~78% vs uncached.
 
 ### Taxonomy Data Management
 
@@ -132,17 +155,19 @@ bun start  # Will download latest
 
 ### Caching Strategy
 
-**SQLite cache in `data/mappings.db`:**
-- Cache key: Exact string (category path or product title)
+**SQLite result cache in `data/mappings.db`:**
+- Cache key: input string, normalized via `trim().toLowerCase().replace(/\s+/g, ' ')`
 - Cache duration: Permanent (until DB deleted)
 - Cache hit: Instant return with `cached: true`
+
+**Normalization:** "Apple AirPods Pro", "  apple  airpods  pro  ", and "APPLE AIRPODS PRO" all hit the same cache row. Different content (e.g. "Apple Airpods Pro" vs "Apple AirPods Pro") still produces different rows — case-insensitive only, not fuzzy.
 
 **Clear cache:**
 ```bash
 rm data/mappings.db
 ```
 
-**Important:** Cache is based on exact string match. "Apple AirPods Pro" ≠ "Apple Airpods Pro"
+This is separate from Bedrock's prompt cache (above), which is per-turn LLM-input caching not result caching.
 
 ### Multi-Turn Hierarchical Navigation
 
@@ -160,15 +185,18 @@ console.log(`    └─ LLM selected: "${selectedCategory}"`);
 console.log(`    └─ Selected: ${child.name}${child.children.length === 0 ? ' (LEAF)' : ''}`);
 ```
 
-**"Other" fallback option:**
-Always add to child options to allow stopping at parent when subcategories too specific:
+**"None of these match" fallback option:**
+Added to child options so the model can backtrack when no subcategory fits:
 
 ```typescript
 childOptions.push({
-  name: 'Other (use parent category)',
-  isLeaf: true,
+  name: 'None of these match',
+  isLeaf: false,
+  childNames: [],
 });
 ```
+
+When chosen, the mapper pops the current node and tries siblings (or re-picks a top-level vertical if the stack empties). MAX_BACKTRACKS = 5; beyond that we return the deepest reached category with `confidence: 'low'`.
 
 ## File Structure
 
@@ -176,12 +204,15 @@ childOptions.push({
 shopify-taxonomy-mapper/
 ├── src/
 │   ├── server.ts              # HTTP server + API routes
-│   ├── nova-client.ts         # AWS Bedrock Nova client
-│   ├── hierarchical-mapper.ts # Multi-turn navigation logic
+│   ├── nova-client.ts         # Bedrock Converse client (Nova + Claude tolerant)
+│   ├── hierarchical-mapper.ts # Multi-turn navigation logic with prompt-cache friendly prompts
 │   ├── taxonomy-loader.ts     # Category indexing
 │   ├── data-fetcher.ts        # GitHub auto-update
-│   ├── database.ts            # SQLite cache
+│   ├── database.ts            # SQLite result cache (normalized keys)
 │   └── types.ts               # TypeScript definitions
+├── eval/
+│   ├── eval-models.ts         # bun run eval — accuracy/speed across candidate models
+│   └── measure-cache.ts       # bun run measure-cache — verify Bedrock prompt cache hits
 ├── data/
 │   ├── categories.json        # Shopify taxonomy (auto-downloaded)
 │   └── mappings.db            # SQLite cache (auto-created)
@@ -318,9 +349,9 @@ Health check and statistics.
 
 ### Issue: "Could not find category" errors
 
-**Cause:** Not using JSON schema structured output (free-text LLM responses don't match exact category names)
+**Cause:** Forced tool choice not in use OR model picked a child-hint name not in the enum.
 
-**Solution:** Always use JSON schema with enum constraints in `askForSelection()`. See "JSON Schema Structured Output" section above.
+**Solution:** Confirm `toolChoice: { tool: { name: 'submit_selection' } }` is set in nova-client.ts. The validation guard in `askForSelection` recovers from child-hint confusion by falling back to the parent option — but if it logs an error, that's a hint the option list format needs work.
 
 ### Issue: Taxonomy data not available
 
@@ -351,19 +382,23 @@ Health check and statistics.
 
 ## Performance Characteristics
 
-**Typical mapping:**
-- Turns: 3-5
-- Time: 1.5-3 seconds total
-- Per-turn: 400-700ms (depends on model)
+**Typical mapping (Nova 2 Lite):**
+- Turns: 3-7 (avg ~5-6)
+- Time: 2-4 seconds total
+- Per-turn: 400-700ms
 
-**Cache performance:**
-- First request: 1.5-3s (LLM inference)
-- Cached request: 10-20ms (99% faster)
+**SQLite result cache:**
+- First request: 2-4s (LLM drill-down)
+- Cached (same input): 10-20ms
 
-**Cost (Nova Micro):**
-- ~$0.003-0.004 per mapping
-- 50x cheaper than Claude Sonnet
-- Cached requests: Free
+**Bedrock prompt cache (warm):**
+- ~78% cost reduction vs uncached on the LLM side
+- No latency penalty — actually slightly faster (less re-tokenization)
+
+**Cost per mapping:**
+- Nova 2 Lite, no caching: ~$0.0032
+- Nova 2 Lite, with prompt cache warm: ~$0.0007
+- SQLite-cached repeat: ~$0
 
 ## Code Style and Conventions
 

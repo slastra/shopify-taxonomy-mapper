@@ -25,6 +25,9 @@ logs/
 *.swo
 *~
 
+# Claude Code runtime artifacts
+.claude/scheduled_tasks.lock
+
 # OS
 .DS_Store
 Thumbs.db

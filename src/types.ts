@@ -3,18 +3,12 @@ export interface CategoryReference {
   name: string;
 }
 
-export interface TaxonomyAttribute {
-  id: string;
-  name: string;
-}
-
 export interface Category {
   id: string;
   level: number;
   name: string;
   full_name: string;
   parent_id: string | null;
-  attributes: TaxonomyAttribute[];
   children: CategoryReference[];
   ancestors: CategoryReference[];
 }
@@ -34,16 +28,6 @@ export interface SearchResult {
   category: Category;
   score: number;
   matchType: 'exact' | 'partial' | 'fuzzy';
-}
-
-export interface CategoryMetadata {
-  id: string;
-  name: string;
-  full_name: string;
-  level: number;
-  is_leaf: boolean;
-  children_count: number;
-  parent_id: string | null;
 }
 
 export interface CategoryMapping {

@@ -7,8 +7,12 @@ import {
   ContentBlock,
   type ConverseCommandInput,
   type ToolInputSchema,
+  type InferenceConfiguration,
 } from '@aws-sdk/client-bedrock-runtime';
 import type { DocumentType } from '@smithy/types';
+import { DEFAULT_MODEL_ID } from './models.js';
+
+const STRUCTURED_OUTPUT_TOOL_NAME = 'submit_selection';
 
 export interface NovaConfig {
   region?: string;
@@ -32,7 +36,21 @@ export interface NovaResponse {
     inputTokens: number;
     outputTokens: number;
     totalTokens: number;
+    cacheReadInputTokens?: number;
+    cacheWriteInputTokens?: number;
   };
+}
+
+export interface ConverseOptions {
+  tools?: BedrockTool[];
+  systemPrompt?: string;
+  jsonSchema?: Record<string, unknown>;
+  /**
+   * Static prefix prepended to the user message and followed by a cachePoint marker.
+   * Identical prefixes across calls hit Bedrock's prompt cache. Nova requires ≥1024
+   * cumulative tokens before the cachePoint for caching to take effect.
+   */
+  cacheableContext?: string;
 }
 
 export class NovaLiteClient {
@@ -53,234 +71,131 @@ export class NovaLiteClient {
 
     this.client = new BedrockRuntimeClient({
       region,
-      credentials: {
-        accessKeyId,
-        secretAccessKey,
-      },
+      credentials: { accessKeyId, secretAccessKey },
     });
 
-    // Amazon Nova model ID (default to Micro, can override via NOVA_MODEL_ID env var)
-    this.modelId = config.modelId || process.env.NOVA_MODEL_ID || 'us.amazon.nova-micro-v1:0';
+    this.modelId = config.modelId || process.env.NOVA_MODEL_ID || DEFAULT_MODEL_ID;
   }
 
   /**
-   * Send a message to Nova using Tool Use for structured output
-   *
-   * When jsonSchema is provided, we define a tool with that schema and force
-   * the model to "call" it, guaranteeing structured output that matches the schema.
+   * Send a message to Bedrock. When `jsonSchema` is provided, a synthetic tool
+   * is registered with that schema and `toolChoice` forces the model to call it,
+   * yielding guaranteed-shape structured output via the tool's input.
    */
-  async converse(
-    userMessage: string,
-    tools?: BedrockTool[],
-    systemPrompt?: string,
-    jsonSchema?: Record<string, unknown>,
-  ): Promise<NovaResponse> {
-    // Add user message to history
-    this.conversationHistory.push({
-      role: 'user',
-      content: [{ text: userMessage }],
-    });
+  async converse(userMessage: string, opts: ConverseOptions = {}): Promise<NovaResponse> {
+    const { tools, systemPrompt, jsonSchema, cacheableContext } = opts;
 
-    // Prepare system prompts
-    const systemPrompts = systemPrompt ? [{ text: systemPrompt }] : undefined;
+    const userContent: ContentBlock[] = cacheableContext
+      ? [
+        { text: cacheableContext },
+        { cachePoint: { type: 'default' } } as ContentBlock,
+        { text: userMessage },
+      ]
+      : [{ text: userMessage }];
 
-    // Build tool configuration
-    let toolConfig: ToolConfiguration | undefined;
-
-    if (jsonSchema) {
-      // Use Tool Use for structured output - define a tool with the schema
-      // The model will "call" this tool with input matching the schema
-      const inputSchema: ToolInputSchema = {
-        json: jsonSchema as DocumentType,
-      };
-      const structuredOutputTool: BedrockTool = {
-        toolSpec: {
-          name: 'submit_selection',
-          description: 'Submit the selected category and confidence level. You MUST call this tool with your selection.',
-          inputSchema,
-        },
-      };
-
-      // Combine with any other tools provided
-      const allTools = tools ? [...tools, structuredOutputTool] : [structuredOutputTool];
-      toolConfig = {
-        tools: allTools,
-        toolChoice: {
-          tool: { name: 'submit_selection' }, // Force the model to use this specific tool
-        },
-      };
-    } else if (tools) {
-      toolConfig = { tools };
-    }
+    this.conversationHistory.push({ role: 'user', content: userContent });
 
     const commandParams: ConverseCommandInput = {
       modelId: this.modelId,
       messages: this.conversationHistory,
-      system: systemPrompts,
-      toolConfig,
-      inferenceConfig: {
-        maxTokens: 512,
-        temperature: 0.3,
-        topP: 0.9,
-      },
+      system: systemPrompt ? [{ text: systemPrompt }] : undefined,
+      toolConfig: this.buildToolConfig(tools, jsonSchema),
+      inferenceConfig: this.inferenceConfig(),
     };
 
-    const command = new ConverseCommand(commandParams);
+    const response = await this.client.send(new ConverseCommand(commandParams));
 
-    const response = await this.client.send(command);
-
-    // Extract response data
     const outputMessage = response.output?.message;
-    const stopReason = response.stopReason || 'unknown';
-    const usage = response.usage || { inputTokens: 0, outputTokens: 0, totalTokens: 0 };
-
-    // Add assistant response to history
     if (outputMessage) {
       this.conversationHistory.push(outputMessage);
     }
 
-    // Parse response
-    const result: NovaResponse = {
-      stopReason,
-      usage: {
-        inputTokens: usage.inputTokens || 0,
-        outputTokens: usage.outputTokens || 0,
-        totalTokens: usage.totalTokens || 0,
-      },
-    };
-
-    // Extract text or tool calls
-    if (outputMessage?.content) {
-      for (const content of outputMessage.content) {
-        if ('text' in content && content.text) {
-          result.text = content.text;
-        }
-        if ('toolUse' in content && content.toolUse) {
-          if (!result.toolCalls) result.toolCalls = [];
-          const input = content.toolUse.input;
-          const toolInput = (typeof input === 'object' && input !== null && !Array.isArray(input))
-            ? input as Record<string, unknown>
-            : {};
-
-          result.toolCalls.push({
-            toolUseId: content.toolUse.toolUseId || '',
-            name: content.toolUse.name || '',
-            input: toolInput,
-          });
-
-          // If this is our structured output tool, extract as structuredOutput
-          if (content.toolUse.name === 'submit_selection') {
-            result.structuredOutput = toolInput;
-          }
-        }
-      }
-    }
-
-    return result;
+    return this.parseResponse(response);
   }
 
-  /**
-   * Continue conversation with tool results
-   */
-  async continueWithToolResults(
-    toolResults: Array<{ toolUseId: string; content: string }>,
-    tools?: BedrockTool[],
-    systemPrompt?: string,
-  ): Promise<NovaResponse> {
-    // Add tool result message to history
-    const toolResultContent: ContentBlock[] = toolResults.map(result => ({
-      toolResult: {
-        toolUseId: result.toolUseId,
-        content: [{ text: result.content }],
-      },
-    }));
-
-    this.conversationHistory.push({
-      role: 'user',
-      content: toolResultContent,
-    });
-
-    // Prepare tool configuration if tools provided
-    const toolConfig: ToolConfiguration | undefined = tools
-      ? { tools }
-      : undefined;
-
-    // Prepare system prompts
-    const system = systemPrompt
-      ? [{ text: systemPrompt }]
-      : undefined;
-
-    // Continue conversation
-    const command = new ConverseCommand({
-      modelId: this.modelId,
-      messages: this.conversationHistory,
-      system,
-      toolConfig,
-      inferenceConfig: {
-        maxTokens: 512,   // Sufficient for JSON response with confidence
-        temperature: 0.3, // Slightly higher for semantic flexibility
-        topP: 0.9,        // Better token diversity
-      },
-    });
-
-    const response = await this.client.send(command);
-
-    // Extract response
-    const outputMessage = response.output?.message;
-    const stopReason = response.stopReason || 'unknown';
-    const usage = response.usage || { inputTokens: 0, outputTokens: 0, totalTokens: 0 };
-
-    if (outputMessage) {
-      this.conversationHistory.push(outputMessage);
-    }
-
-    const result: NovaResponse = {
-      stopReason,
-      usage: {
-        inputTokens: usage.inputTokens || 0,
-        outputTokens: usage.outputTokens || 0,
-        totalTokens: usage.totalTokens || 0,
-      },
-    };
-
-    if (outputMessage?.content) {
-      for (const content of outputMessage.content) {
-        if ('text' in content && content.text) {
-          result.text = content.text;
-        }
-        if ('toolUse' in content && content.toolUse) {
-          if (!result.toolCalls) result.toolCalls = [];
-          const input = content.toolUse.input;
-          result.toolCalls.push({
-            toolUseId: content.toolUse.toolUseId || '',
-            name: content.toolUse.name || '',
-            input: (typeof input === 'object' && input !== null && !Array.isArray(input)) ? input as Record<string, unknown> : {},
-          });
-        }
-      }
-    }
-
-    return result;
-  }
-
-  /**
-   * Reset conversation history
-   */
   resetConversation(): void {
     this.conversationHistory = [];
   }
 
-  /**
-   * Get conversation history
-   */
-  getHistory(): Message[] {
-    return this.conversationHistory;
-  }
-
-  /**
-   * Get the current model ID
-   */
   getModelId(): string {
     return this.modelId;
+  }
+
+  // Bedrock rejects `temperature` + `topP` together for Anthropic Claude models.
+  private inferenceConfig(): InferenceConfiguration {
+    const isAnthropicClaude = this.modelId.includes('anthropic.claude');
+    return {
+      maxTokens: 512,
+      temperature: 0.3,
+      ...(isAnthropicClaude ? {} : { topP: 0.9 }),
+    };
+  }
+
+  private buildToolConfig(
+    extraTools: BedrockTool[] | undefined,
+    jsonSchema: Record<string, unknown> | undefined,
+  ): ToolConfiguration | undefined {
+    if (!jsonSchema) {
+      return extraTools ? { tools: extraTools } : undefined;
+    }
+    const inputSchema: ToolInputSchema = { json: jsonSchema as DocumentType };
+    const structuredTool: BedrockTool = {
+      toolSpec: {
+        name: STRUCTURED_OUTPUT_TOOL_NAME,
+        description: 'Submit the selected category and confidence level.',
+        inputSchema,
+      },
+    };
+    return {
+      tools: extraTools ? [...extraTools, structuredTool] : [structuredTool],
+      toolChoice: { tool: { name: STRUCTURED_OUTPUT_TOOL_NAME } },
+    };
+  }
+
+  private parseResponse(response: { output?: { message?: Message }; stopReason?: string; usage?: unknown }): NovaResponse {
+    const outputMessage = response.output?.message;
+    const usage = (response.usage || {}) as {
+      inputTokens?: number;
+      outputTokens?: number;
+      totalTokens?: number;
+      cacheReadInputTokens?: number;
+      cacheWriteInputTokens?: number;
+    };
+
+    const result: NovaResponse = {
+      stopReason: response.stopReason || 'unknown',
+      usage: {
+        inputTokens: usage.inputTokens || 0,
+        outputTokens: usage.outputTokens || 0,
+        totalTokens: usage.totalTokens || 0,
+        cacheReadInputTokens: usage.cacheReadInputTokens,
+        cacheWriteInputTokens: usage.cacheWriteInputTokens,
+      },
+    };
+
+    for (const content of outputMessage?.content || []) {
+      if ('text' in content && content.text) {
+        result.text = content.text;
+      }
+      if ('toolUse' in content && content.toolUse) {
+        const raw = content.toolUse.input;
+        const input = (typeof raw === 'object' && raw !== null && !Array.isArray(raw))
+          ? raw as Record<string, unknown>
+          : {};
+
+        result.toolCalls ??= [];
+        result.toolCalls.push({
+          toolUseId: content.toolUse.toolUseId || '',
+          name: content.toolUse.name || '',
+          input,
+        });
+
+        if (content.toolUse.name === STRUCTURED_OUTPUT_TOOL_NAME) {
+          result.structuredOutput = input;
+        }
+      }
+    }
+
+    return result;
   }
 }

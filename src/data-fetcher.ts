@@ -1,173 +1,88 @@
-import { writeFile, readFile, exists, mkdir } from 'fs/promises';
+import { writeFile, readFile, mkdir } from 'fs/promises';
 import { join, dirname } from 'path';
+import { errMessage } from './errors.js';
 
 const GITHUB_REPO = 'Shopify/product-taxonomy';
 const GITHUB_BRANCH = 'main';
 const DATA_FILE_PATH = 'dist/en/categories.json';
 const LOCAL_DATA_PATH = join(import.meta.dirname, '../data/categories.json');
 
+const REMOTE_URL = `https://raw.githubusercontent.com/${GITHUB_REPO}/${GITHUB_BRANCH}/${DATA_FILE_PATH}`;
+
 interface TaxonomyData {
   version: string;
   [key: string]: unknown;
 }
 
+async function readLocal(): Promise<TaxonomyData | null> {
+  try {
+    const text = await readFile(LOCAL_DATA_PATH, 'utf-8');
+    return JSON.parse(text) as TaxonomyData;
+  } catch {
+    return null;
+  }
+}
+
+async function fetchRemote(): Promise<{ text: string; data: TaxonomyData }> {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 60_000);
+  try {
+    const response = await fetch(REMOTE_URL, {
+      signal: controller.signal,
+      headers: { Accept: 'application/json' },
+    });
+    if (!response.ok) {
+      throw new Error(`GitHub returned ${response.status}: ${response.statusText}`);
+    }
+    const text = await response.text();
+    const data = JSON.parse(text) as TaxonomyData;
+    if (!data.version) {
+      throw new Error('Remote taxonomy data missing version field');
+    }
+    return { text, data };
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
 /**
- * Fetch taxonomy data from Shopify's GitHub repository
- * Implements smart caching with version checking
+ * Fetch taxonomy data from Shopify's GitHub repo with version-aware caching.
+ * Single fetch of the remote body — if version differs from local, the same body
+ * is written to disk (no re-download).
  */
 export class DataFetcher {
-  /**
-   * Ensure taxonomy data is available and up-to-date
-   * Downloads from GitHub if needed, falls back to cached version
-   */
   async ensureTaxonomyData(): Promise<void> {
     console.log('Checking taxonomy data...');
+    const local = await readLocal();
+    if (local) {
+      console.log(`✓ Local taxonomy found (version ${local.version})`);
+    }
 
+    let remote: { text: string; data: TaxonomyData };
     try {
-      // Check if local file exists
-      const localExists = await exists(LOCAL_DATA_PATH);
-      let localVersion: string | null = null;
-
-      if (localExists) {
-        try {
-          const localData = await readFile(LOCAL_DATA_PATH, 'utf-8');
-          const parsed = JSON.parse(localData) as TaxonomyData;
-          localVersion = parsed.version;
-          console.log(`✓ Local taxonomy found (version ${localVersion})`);
-        } catch {
-          console.warn('⚠ Local taxonomy file corrupted, will re-download');
-        }
-      }
-
-      // Try to fetch latest version info from GitHub
-      try {
-        const remoteVersion = await this.getRemoteVersion();
-        console.log(`✓ Remote taxonomy version: ${remoteVersion}`);
-
-        // Download if we don't have it or if version is different
-        if (!localVersion || localVersion !== remoteVersion) {
-          console.log(`Downloading taxonomy data (${remoteVersion})...`);
-          try {
-            await this.downloadTaxonomyData();
-            console.log('✓ Taxonomy data downloaded successfully');
-          } catch (downloadError) {
-            console.error('Download failed:', downloadError instanceof Error ? downloadError.message : String(downloadError));
-            throw downloadError;
-          }
-          return;
-        } else {
-          console.log('✓ Local taxonomy is up-to-date');
-          return;
-        }
-      } catch (error) {
-        // GitHub unavailable - fall back to cached version
-        if (localExists && localVersion) {
-          console.warn('⚠ GitHub unavailable, using cached version:', localVersion);
-          console.warn('  Error:', error instanceof Error ? error.message : String(error));
-          return;
-        } else {
-          // No cached version and GitHub unavailable - cannot continue
-          throw new Error(
-            'Taxonomy data not available: GitHub is unreachable and no cached version exists. ' +
-            'Please check your internet connection or manually download categories.json from: ' +
-            `https://github.com/${GITHUB_REPO}/blob/${GITHUB_BRANCH}/${DATA_FILE_PATH}`,
-          );
-        }
-      }
+      remote = await fetchRemote();
+      console.log(`✓ Remote taxonomy version: ${remote.data.version}`);
     } catch (error) {
-      throw new Error(`Failed to ensure taxonomy data: ${error instanceof Error ? error.message : String(error)}`);
-    }
-  }
-
-  /**
-   * Get the version of the remote taxonomy data without downloading the full file
-   */
-  private async getRemoteVersion(): Promise<string> {
-    const url = `https://raw.githubusercontent.com/${GITHUB_REPO}/${GITHUB_BRANCH}/${DATA_FILE_PATH}`;
-
-    // Fetch with timeout
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 10000); // 10 second timeout
-
-    try {
-      const response = await fetch(url, {
-        signal: controller.signal,
-        headers: {
-          'Accept': 'application/json',
-        },
-      });
-
-      if (!response.ok) {
-        throw new Error(`GitHub returned ${response.status}: ${response.statusText}`);
+      if (local) {
+        console.warn('⚠ GitHub unavailable, using cached version:', local.version);
+        console.warn('  Error:', errMessage(error));
+        return;
       }
-
-      // Read just enough to get the version field (first ~200 bytes should be plenty)
-      const text = await response.text();
-      const data = JSON.parse(text) as TaxonomyData;
-
-      if (!data.version) {
-        throw new Error('Remote taxonomy data missing version field');
-      }
-
-      return data.version;
-    } finally {
-      clearTimeout(timeout);
+      throw new Error(
+        'Taxonomy data not available: GitHub is unreachable and no cached version exists. ' +
+        'Please check your internet connection or manually download categories.json from: ' +
+        `https://github.com/${GITHUB_REPO}/blob/${GITHUB_BRANCH}/${DATA_FILE_PATH}`,
+      );
     }
-  }
 
-  /**
-   * Download the full taxonomy data file from GitHub
-   */
-  private async downloadTaxonomyData(): Promise<void> {
-    const url = `https://raw.githubusercontent.com/${GITHUB_REPO}/${GITHUB_BRANCH}/${DATA_FILE_PATH}`;
-
-    // Fetch with longer timeout for full file (30MB)
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 60000); // 60 second timeout
-
-    try {
-      const response = await fetch(url, {
-        signal: controller.signal,
-        headers: {
-          'Accept': 'application/json',
-        },
-      });
-
-      if (!response.ok) {
-        throw new Error(`GitHub returned ${response.status}: ${response.statusText}`);
-      }
-
-      const data = await response.text();
-
-      // Validate JSON before writing
-      const parsed = JSON.parse(data) as TaxonomyData;
-      if (!parsed.version) {
-        throw new Error('Downloaded data missing version field');
-      }
-
-      // Ensure data directory exists
-      await mkdir(dirname(LOCAL_DATA_PATH), { recursive: true });
-
-      // Write to local file
-      await writeFile(LOCAL_DATA_PATH, data, 'utf-8');
-    } finally {
-      clearTimeout(timeout);
+    if (local && local.version === remote.data.version) {
+      console.log('✓ Local taxonomy is up-to-date');
+      return;
     }
-  }
 
-  /**
-   * Get the current local taxonomy version
-   */
-  async getLocalVersion(): Promise<string | null> {
-    try {
-      const localExists = await exists(LOCAL_DATA_PATH);
-      if (!localExists) return null;
-
-      const data = await readFile(LOCAL_DATA_PATH, 'utf-8');
-      const parsed = JSON.parse(data) as TaxonomyData;
-      return parsed.version || null;
-    } catch {
-      return null;
-    }
+    console.log(`Downloading taxonomy data (${remote.data.version})...`);
+    await mkdir(dirname(LOCAL_DATA_PATH), { recursive: true });
+    await writeFile(LOCAL_DATA_PATH, remote.text, 'utf-8');
+    console.log('✓ Taxonomy data downloaded successfully');
   }
 }
