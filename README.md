@@ -1,426 +1,240 @@
 # Shopify Taxonomy Mapper
 
-Intelligent HTTP API for mapping Amazon categories and product titles to Shopify's official product taxonomy using Amazon Nova Lite.
+HTTP API that maps Amazon products to Shopify's official product taxonomy, using [TypeSafe's Jev](https://docs.typesafe.ai) decision model. Send what you know about a product (title, brand, feature bullets, Amazon category path) and get a Shopify category, a score, and runner-up alternatives.
 
 ## Features
 
-- **Intelligent Mapping**: Uses Amazon Nova Lite for semantic category matching via multi-turn hierarchical navigation
-- **11,768 Shopify Categories**: Complete Shopify product taxonomy (auto-updated from GitHub)
-- **Smart Caching**: SQLite-based cache prevents redundant API calls
-- **Auto-Update**: Checks Shopify's GitHub repository for taxonomy updates on startup
-- **Fast Performance**: 3-4 turns typical, ~2-3 seconds per mapping
-- **Fallback Safety**: Uses cached taxonomy if GitHub is unavailable
-- **CORS Enabled**: Ready for browser-based applications
+- **Maps the product, not just its category path**: on real inventory, title + brand + bullets beat the Amazon category path alone, which is often shallow ("Clothing, Shoes & Jewelry > Women") or describes something else ("Suitcases" for luggage-wheel covers)
+- **Beam search over the taxonomy** plus keyword candidates and an order-debiased final comparison (see How It Works)
+- **Scored answers with alternatives**: a 0-1 score, `high` / `medium` / `low` confidence, and the next 3 candidates
+- **Corrections loop**: `POST /api/feedback` stores a person's choice; it's served for that product from then on and kept as a label
+- **Pinned taxonomy release**: 14,606 Shopify categories from a stable release, downloaded once
+- **SQLite result cache**: keyed by ASIN when given; repeat lookups return in milliseconds
+- **Fast and cheap**: ~1.3 s and ~$0.0008 per uncached mapping
 
 ## How It Works
 
-### Hierarchical Drill-Down Strategy
+Jev doesn't generate text. It answers typed questions with a probability for every option. The mapper exploits that:
 
-The API uses a multi-turn conversation with Amazon Nova Lite to intelligently navigate the taxonomy tree:
+1. **Level 1**: one choice question over the 26 top-level verticals. Each option lists up to 20 of its subcategories so the model can see what a branch holds.
+2. **Each later level**: every surviving path asks "which subcategory of `<path>` fits this item?". All paths' questions go in **one** request, which Jev evaluates in parallel.
+3. **Stopping early**: from three levels deep, each question also offers "none of these, this category in general", so a general input like "Picture Frames" can end on a non-leaf category.
+4. **Pruning**: open paths are ranked by the geometric mean of their edge probabilities, and the top 5 survive. Paths that finish (at a leaf, or by stopping) move to a candidate pool instead of competing for those 5 slots.
+5. **Keyword candidates**: a keyword search over the 14,000 category names adds its top 5 hits, catching categories the walk pruned early. Smart Watches, for example, sits under Apparel & Accessories > Jewelry.
+6. **Final comparison**: one question puts the best 8 walk candidates and the keyword hits side by side by full category path. It's asked in both option orders and averaged. The winner's probability is the mapping's `score`; the next 3 are its `alternatives`.
 
-1. **Turn 1**: Select from 26 top-level verticals (Animals & Pet Supplies, Electronics, Furniture, etc.)
-2. **Turn 2+**: Drill down through subcategories level by level
-3. **Smart Selection**: Nova Lite makes semantic matches based on product context
-4. **Leaf Detection**: Continues until reaching most specific category
-5. **Fallback Option**: "Other (use parent category)" available when subcategories are too specific
+Every question sees the same `state`: the product's title, brand, product group, Amazon category path and up to 5 feature bullets (or just the category path when there's no title).
 
-### Example Flow
+### Example
 
 ```
-Query: "Raspberry Pi 5"
-
-Turn 1: Select vertical
-  → "Electronics"
-
-Turn 2: Select from 20 Electronics children
-  → "Computers"
-
-Turn 3: Select from 12 Computers children
-  → "Barebone Computers" (LEAF)
-
-Result: Electronics > Computers > Barebone Computers
-Time: ~1.9s (3 turns)
+Item:    "Metal Squirrel Baffle for 4X4 Post, 17 Inch Square Bird Feeder Guard…"
+         Amazon category: Patio, Lawn & Garden > Backyard Birding & Wildlife > Birds > Feeder Accessories
+Result:  Home & Garden > Decor > Bird & Wildlife Feeder Accessories > Squirrel Guards
+Score:   1.00 (high), 7 requests
+Alternatives: Predator Guards (0.01), …
 ```
 
 ## Installation
 
 ### Prerequisites
 
-- [Bun](https://bun.sh) runtime (or Node.js >=18)
-- AWS account with Bedrock access (for Nova Lite)
-- AWS credentials with `bedrock:InvokeModel` permission
+- [Bun](https://bun.sh) runtime
+- An [OpenRouter](https://openrouter.ai) API key (Jev is served through OpenRouter's Decisions API)
 
 ### Setup
 
-1. **Clone the repository**:
-   ```bash
-   git clone <repository-url>
-   cd shopify-taxonomy-mapper
-   ```
+```bash
+git clone <repository-url>
+cd shopify-taxonomy-mapper
+bun install
+cp .env.example .env   # then fill in OPENROUTER_API_KEY and API_ACCESS_TOKEN
+bun start
+```
 
-2. **Install dependencies**:
-   ```bash
-   bun install
-   ```
-
-3. **Configure environment** (copy `.env.example` to `.env`):
-   ```bash
-   cp .env.example .env
-   ```
-
-4. **Edit `.env` with your AWS credentials**:
-   ```env
-   AMAZON-KEY=your_aws_access_key_id
-   AMAZON-SECRET=your_aws_secret_access_key
-   AWS_REGION=us-east-1
-   NOVA_MODEL_ID=us.amazon.nova-micro-v1:0
-   HTTP_PORT=3001
-   ```
-
-5. **Build the project**:
-   ```bash
-   bun run build
-   ```
-
-6. **Start the server**:
-   ```bash
-   bun start
-   ```
-
-The server will:
-- Check for taxonomy updates from Shopify's GitHub
-- Download categories.json if needed (or use cached version)
-- Start listening on `http://localhost:3001`
+On first start the server downloads the pinned taxonomy release into `data/categories.json`, then listens on `http://localhost:3001`.
 
 ## API Endpoints
 
-### POST /api/map-category
+`/api/map`, `/api/feedback` and the two legacy mapping endpoints require `Authorization: Bearer <API_ACCESS_TOKEN>`. Search, category and health are open.
 
-Map an Amazon category path to Shopify taxonomy.
+### POST /api/map
 
-**Request:**
-```json
-{
-  "amazon_category": "Tools & Home Improvement > Hardware > Brackets"
-}
-```
+Map a product. Every field is optional, but send a `title` or a category. Field names match Keepa's `product_data`, so a caller can pass its product record as-is.
 
-**Response:**
-```json
-{
-  "node_id": "ha-6-1",
-  "full_name": "Hardware > Hardware Accessories > Brackets & Reinforcement Braces",
-  "confidence": "high",
-  "cached": false,
-  "approach": "hierarchical",
-  "turns": 3
-}
-```
+| Field | Type | Notes |
+|---|---|---|
+| `asin` | string | Keys the cache. Without it, the title + category path is the key |
+| `title` | string | The listing title |
+| `brand` | string | |
+| `features` | string[] | Feature bullets; the first 5 are used, 200 characters each |
+| `product_group` | string | e.g. "Kitchen" |
+| `amazon_category_tree` | `[{ "name": string }]` | Amazon category path, root first. Or send `amazon_category` as a `"A > B > C"` string |
 
-**curl Example:**
 ```bash
-curl -X POST http://localhost:3001/api/map-category \
+curl -X POST http://localhost:3001/api/map \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer YOUR_ACCESS_TOKEN" \
-  -d '{"amazon_category": "Pet Supplies > Dogs > Food"}'
+  -d '{"asin": "B0DNMND41W", "title": "Metal Squirrel Baffle for 4X4 Post…", "brand": "…",
+       "amazon_category_tree": [{"name": "Patio, Lawn & Garden"}, {"name": "Birds"}, {"name": "Feeder Accessories"}]}'
 ```
 
----
-
-### POST /api/map-product
-
-Map a product title to Shopify taxonomy.
-
-**Request:**
 ```json
 {
-  "product_title": "Raspberry Pi 5 8GB RAM"
-}
-```
-
-**Response:**
-```json
-{
-  "node_id": "el-6-1",
-  "full_name": "Electronics > Computers > Barebone Computers",
+  "node_id": "hg-3-7-7",
+  "full_name": "Home & Garden > Decor > Bird & Wildlife Feeder Accessories > Squirrel Guards",
   "confidence": "high",
+  "score": 0.998,
+  "alternatives": [
+    { "node_id": "hg-3-7-6", "full_name": "Home & Garden > Decor > Bird & Wildlife Feeder Accessories > Predator Guards", "score": 0.01 }
+  ],
+  "source": "jev",
   "cached": false,
-  "approach": "hierarchical",
-  "turns": 3
+  "unmapped": false,
+  "turns": 7
 }
 ```
 
-**curl Example:**
-```bash
-curl -X POST http://localhost:3001/api/map-product \
-  -H "Content-Type: application/json" \
-  -H "Authorization: Bearer YOUR_ACCESS_TOKEN" \
-  -d '{"product_title": "Stainless Steel Dog Bowl"}'
+**Response fields:**
+
+| Field | Meaning |
+|---|---|
+| `node_id` | Shopify taxonomy ID, without the GID prefix |
+| `full_name` | Full category path |
+| `score` | Probability Jev gave this category in the final comparison, 0-1. `null` for manual corrections and Nova-era rows |
+| `confidence` | `high` (score ≥ 0.9), `medium` (≥ 0.75), `low` otherwise. Provisional bands; treat `low` as "needs review". Manual corrections are `high` |
+| `alternatives` | The next 3 categories from the final comparison, with their scores |
+| `source` | `jev` (computed), `manual` (a person's correction), or `llm` (cached by the old Nova mapper) |
+| `cached` | `true` when served from the cache |
+| `unmapped` | `true` when the pick is Shopify's Uncategorized: nobody could place the input |
+| `turns` | Jev requests made; `0` when cached |
+
+### POST /api/feedback
+
+Record the category a person chose for a product. Same item fields as `/api/map`, plus `node_id` (a node id like `hg-3-7`, or any taxonomy GID, e.g. `gid://shopify/ProductTaxonomyNode/hg-3-7`). The choice replaces the cached answer for that item, so `/api/map` returns it from then on with `source: "manual"`, and it's logged in the `feedback` table with the previous answer.
+
+```json
+{ "ok": true, "input_key": "asin:B0DNMND41W", "previous_node_id": "hg-3-7-7", "node_id": "hg-3-7", "full_name": "Home & Garden > Decor > Bird & Wildlife Feeder Accessories" }
 ```
 
----
+### POST /api/map-category, POST /api/map-product (legacy)
+
+Single-field versions kept for older callers: `{"amazon_category": "A > B > C"}` and `{"product_title": "…"}`. Same response as `/api/map`. Prefer `/api/map` with every field you have.
 
 ### GET /api/search
 
-Search Shopify categories by keyword (utility endpoint).
+Keyword search over category names (no model involved).
 
-**Query Parameters:**
-- `q` (required): Search query
-- `limit` (optional): Max results (default: 10)
-
-**Response:**
-```json
-{
-  "results": [
-    {
-      "node_id": "ap-2-3-6",
-      "name": "Dog Supplies",
-      "full_name": "Animals & Pet Supplies > Pet Supplies > Dog Supplies",
-      "level": 2
-    }
-  ],
-  "count": 1
-}
-```
-
-**curl Example:**
 ```bash
-curl "http://localhost:3001/api/search?q=dog%20food&limit=5"
+curl "http://localhost:3001/api/search?q=smart%20watch&limit=5"
 ```
-
----
 
 ### GET /api/category/:id
 
-Get detailed category information by node ID (utility endpoint).
+Category details by node ID.
 
-**Response:**
-```json
-{
-  "node_id": "ap-2-3-6",
-  "gid": "gid://shopify/TaxonomyCategory/ap-2-3-6",
-  "name": "Dog Supplies",
-  "full_name": "Animals & Pet Supplies > Pet Supplies > Dog Supplies",
-  "level": 2,
-  "is_leaf": false,
-  "children_count": 15,
-  "parent_id": "gid://shopify/TaxonomyCategory/ap-2-3"
-}
-```
-
-**curl Example:**
 ```bash
 curl http://localhost:3001/api/category/ap-2-3-6
 ```
 
----
-
 ### GET /health
 
-Health check and server statistics.
-
-**Response:**
 ```json
 {
   "status": "ok",
-  "taxonomy_version": "2025-11-unstable",
-  "total_categories": 11768,
+  "model": "typesafe/jev-1.14",
+  "taxonomy_version": "2026-08",
+  "total_categories": 14606,
   "cache_stats": {
     "total": 42,
     "byConfidence": { "high": 30, "medium": 10, "low": 2 },
-    "bySource": { "llm": 42 }
+    "bySource": { "jev": 40, "manual": 2 },
+    "feedback": 2
   }
 }
 ```
 
 ## Data Management
 
-### Taxonomy Updates
+### Taxonomy
 
-The API automatically manages the Shopify product taxonomy data:
+The taxonomy is pinned to a stable Shopify release (`TAXONOMY_RELEASE` in `src/data-fetcher.ts`, currently `v2026-08`). On startup the server reads the version at the top of `data/categories.json`; if it matches, there's no network call. Otherwise it downloads the release from [Shopify's GitHub](https://github.com/Shopify/product-taxonomy), keeping the local copy if GitHub is unreachable. It doesn't use `main`, because unstable category IDs can change before Shopify ships them.
 
-**On Startup:**
-1. Checks if `data/categories.json` exists locally
-2. Fetches version info from [Shopify's GitHub](https://github.com/Shopify/product-taxonomy)
-3. Downloads new version if available
-4. Falls back to cached version if GitHub is unavailable
+### Result cache
 
-**Manual Update:**
-Delete the cached file to force a fresh download:
+Results are cached permanently in `data/mappings.db`, with the model and mapper version that produced them. Keys are normalized (`trim`, lowercase, collapse whitespace). A product with an ASIN is keyed `asin:<ASIN>`; otherwise title + category path. Manual corrections overwrite the row for their key.
+
 ```bash
-rm data/categories.json
-bun start
+rm data/mappings.db                     # clear everything
+sqlite3 data/mappings.db "DELETE FROM amazon_shopify_category_mappings WHERE created_by = 'jev' AND mapper_version != '2026-10-25'"   # drop rows from an older mapper
+sqlite3 data/mappings.db "SELECT * FROM feedback ORDER BY created_at DESC LIMIT 20"   # recent corrections
 ```
-
-### Caching
-
-All mapping results are cached in SQLite (`data/mappings.db`) to prevent redundant Nova API calls:
-
-- **Cache keys**: Amazon category paths or product titles (exact string match)
-- **Cache duration**: Permanent (until database is cleared)
-- **Cache hit**: Returns instantly with `"cached": true`
-
-**Clear cache:**
-```bash
-rm data/mappings.db
-```
-
-## Cost & Performance
-
-### API Costs
-
-- **Nova Lite**: ~$0.003-0.004 per mapping (50x cheaper than Claude)
-- **Cached requests**: Free (instant return)
-
-### Performance Metrics
-
-**Typical mapping:**
-- **Turns**: 3-4
-- **Time**: 1.9-2.8 seconds
-- **Per-turn**: 600-800ms
-
-**Cache performance:**
-- **First request**: 1.9-2.8s (LLM inference)
-- **Cached request**: 10-20ms (99% faster)
 
 ## Development
 
-### Scripts
-
 ```bash
-bun run dev          # Development mode with watch
-bun run build        # Compile TypeScript
-bun start            # Production start
-bun run lint         # ESLint check
-bun run lint:fix     # Auto-fix linting issues
-bun run type-check   # TypeScript validation
+bun run dev          # watch mode
+bun start            # run
+bun run type-check   # tsc over src/ and eval/
+bun run lint         # eslint --fix over src/
+bun run eval         # accuracy harness: 20 adjudicated real-inventory cases
+bun run compare <mappings.db copy> --out <dir> --sample 100   # re-map cached rows and compare
 ```
 
-### Project Structure
+There's no build step: Bun runs the TypeScript directly. `bun run eval` runs the mapper in-process against `eval/test-cases.ts` and prints per-case verdicts, accuracy, latency, and Jev spend. Run it after changing the mapper or the Jev version.
+
+### Project structure
 
 ```
-shopify-taxonomy-mapper/
-├── src/
-│   ├── server.ts              # HTTP server entry point
-│   ├── data-fetcher.ts        # GitHub taxonomy updater
-│   ├── hierarchical-mapper.ts # Mapping logic
-│   ├── taxonomy-loader.ts     # Category indexing
-│   ├── database.ts            # SQLite cache
-│   ├── nova-client.ts         # AWS Bedrock client
-│   └── types.ts               # Type definitions
-├── data/
-│   ├── categories.json        # Shopify taxonomy (auto-downloaded)
-│   └── mappings.db            # SQLite cache (auto-created)
-├── dist/                      # Compiled JavaScript
-├── package.json
-├── tsconfig.json
-├── .env                       # Environment variables (not in git)
-└── README.md
+src/
+├── server.ts              # HTTP server and routes
+├── hierarchical-mapper.ts # Beam search over Jev choice questions
+├── jev-client.ts          # OpenRouter Decisions API client
+├── taxonomy-loader.ts     # In-memory category index + keyword search
+├── data-fetcher.ts        # Pinned taxonomy release download
+├── database.ts            # SQLite result cache, corrections, migrations
+└── types.ts               # Shared types
+eval/
+├── iterate.ts             # bun run eval
+├── compare-cache.ts       # bun run compare
+├── counting-client.ts     # Request/cost tally for eval scripts
+└── test-cases.ts          # Adjudicated cases
 ```
 
 ## Deployment
 
-### Docker (recommended)
+### Coolify (nixpacks)
 
-```dockerfile
-FROM oven/bun:1
+`nixpacks.toml` builds with the Bun provider and starts `bun src/server.ts`. Set `OPENROUTER_API_KEY` and `API_ACCESS_TOKEN` in the app's environment.
 
-WORKDIR /app
-COPY package.json bun.lockb ./
-RUN bun install
-
-COPY . .
-RUN bun run build
-
-EXPOSE 3001
-CMD ["bun", "start"]
-```
-
-### Systemd Service (Production)
-
-The project includes an automated installer for systemd service deployment:
+### Systemd
 
 ```bash
-# Install and configure the systemd service
 sudo ./install-service.sh
-
-# Start the service
 sudo systemctl start shopify-taxonomy-mapper
-
-# Check status
-sudo systemctl status shopify-taxonomy-mapper
-
-# View logs (follow mode)
 sudo journalctl -u shopify-taxonomy-mapper -f
-
-# View logs (last 100 lines)
-sudo journalctl -u shopify-taxonomy-mapper -n 100
-
-# Restart the service
-sudo systemctl restart shopify-taxonomy-mapper
-
-# Stop the service
-sudo systemctl stop shopify-taxonomy-mapper
 ```
 
-**Features:**
-- Auto-detects deployment directory and user
-- Auto-restart on crashes (10s delay, max 3 attempts/minute)
-- Memory limit: 1GB
-- CPU limit: 100%
-- Basic security hardening (private tmp, no new privileges)
-- Integrated with systemd journal for logging
-- Auto-start on system boot
+The installer reads secrets from `.env` in the project directory.
 
-### Environment Variables
+### Environment variables
 
-Required:
-- `AMAZON-KEY`: AWS access key ID
-- `AMAZON-SECRET`: AWS secret access key
-- `AWS_REGION`: AWS region (default: us-east-1)
-- `API_ACCESS_TOKEN`: Access token for API authentication (generate with `openssl rand -hex 32`)
-
-Optional:
-- `NOVA_MODEL_ID`: Nova model to use (default: us.amazon.nova-micro-v1:0)
-  - Options: `us.amazon.nova-micro-v1:0`, `us.amazon.nova-lite-v1:0`, `us.amazon.nova-pro-v1:0`
-- `HTTP_PORT`: Server port (default: 3001)
-
-### Production Checklist
-
-- [ ] Set AWS credentials with least-privilege IAM policy
-- [ ] Configure reverse proxy (nginx/Caddy) with HTTPS
-- [ ] Set up monitoring for API errors and latency
-- [ ] Consider rate limiting for public deployment
-- [ ] Review CORS settings in `src/server.ts`
+| Variable | Required | Default |
+|---|---|---|
+| `OPENROUTER_API_KEY` | yes | |
+| `API_ACCESS_TOKEN` | yes | generate with `openssl rand -hex 32` |
+| `JEV_MODEL` | no | `typesafe/jev-1.14` (pinned) |
+| `HTTP_PORT` | no | `3001` |
 
 ## Troubleshooting
 
-### Issue: "Taxonomy data not available"
+**"OpenRouter API key is required"**: `OPENROUTER_API_KEY` is missing from the environment.
 
-**Cause:** First run and GitHub is unreachable.
+**"Jev request failed (4xx)"**: check the key and OpenRouter credit. 429s and 5xx are retried up to three times automatically.
 
-**Solution:** Manually download [categories.json](https://github.com/Shopify/product-taxonomy/blob/main/dist/en/categories.json) to `data/categories.json`.
+**"Taxonomy data not available"**: first run with GitHub unreachable. Download [categories.json](https://github.com/Shopify/product-taxonomy/blob/main/dist/en/categories.json) to `data/categories.json`.
 
-### Issue: "AWS credentials are required"
-
-**Cause:** Missing or invalid AWS credentials in `.env`.
-
-**Solution:**
-1. Verify `.env` file exists and contains valid credentials
-2. Test AWS access: `aws bedrock list-foundation-models --region us-east-1`
-3. Ensure IAM permissions include `bedrock:InvokeModel`
-
-### Issue: Slow mapping performance
-
-**Possible causes:**
-- Cold start (first request after restart)
-- Large number of subcategories (>40)
-- Network latency to AWS Bedrock
-
-**Solutions:**
-- Enable caching (default)
-- Monitor per-turn latency in logs
-- Consider adjusting Nova Lite timeout settings
+**401 Unauthorized**: the `Authorization: Bearer <token>` header doesn't match `API_ACCESS_TOKEN`.
 
 ## License
 
@@ -428,6 +242,6 @@ MIT
 
 ## Acknowledgments
 
-- [Shopify Product Taxonomy](https://github.com/Shopify/product-taxonomy) - Official Shopify category data
-- [Amazon Nova Lite](https://aws.amazon.com/bedrock/nova/) - Fast LLM for semantic matching
-- [Bun](https://bun.sh) - Fast JavaScript runtime
+- [Shopify Product Taxonomy](https://github.com/Shopify/product-taxonomy)
+- [TypeSafe Jev](https://docs.typesafe.ai)
+- [Bun](https://bun.sh)

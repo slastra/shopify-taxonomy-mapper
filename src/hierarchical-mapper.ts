@@ -1,376 +1,366 @@
-import { NovaLiteClient } from './nova-client.js';
+import { JevClient, type ChoiceAnswer, type ChoiceQuestion, type Criterion } from './jev-client.js';
 import { TaxonomyLoader } from './taxonomy-loader.js';
 import { MappingCache } from './database.js';
 import { stripGid } from './ids.js';
+import type { Alternative, Category, Confidence, StoredMapping } from './types.js';
 
-/**
- * System prompt with key disambiguation rules for Shopify's taxonomy
- */
-const TAXONOMY_SYSTEM_PROMPT = `You categorize products into Shopify's taxonomy.
+// Open paths kept per level. Wider beams recover from an ambiguous early pick
+// (gift bags, reading glasses) at the cost of more questions per request.
+const BEAM_WIDTH = 5;
+// Finished candidates (by path score) that go to the final comparison.
+const POOL_SIZE = 8;
+// Keyword-search hits added to the final comparison alongside the beam's candidates.
+const KEYWORD_CANDIDATES = 5;
+// Grandchild names shown under each option so the model can see what a branch holds.
+const HINT_COUNT = 20;
+// Stopping at a node is offered from this level down (0 = vertical). Level 2 is
+// e.g. "Home & Garden > Decor > Picture Frames"; stopping higher was too broad.
+const MIN_STOP_LEVEL = 2;
+// Taxonomy is 7 levels deep; this only guards against a malformed tree.
+const MAX_DEPTH = 10;
+const MIN_PROBABILITY = 1e-6;
+// Runner-up categories returned alongside the pick.
+const ALTERNATIVE_COUNT = 3;
+// Feature bullets kept from a listing, and characters per bullet.
+const FEATURE_LIMIT = 5;
+const FEATURE_CHARS = 200;
+// Shopify's "Uncategorized" node: Jev's answer for input nobody could place.
+const UNCATEGORIZED_ID = 'na';
 
-Key rules for Shopify's taxonomy:
-- Kitchen appliances (mixers, blenders, pressure cookers, etc.) go under "Kitchen & Dining", NOT "Household Appliances"
-- "Household Appliances" is for laundry machines, vacuums, air purifiers - NOT kitchen items
-- Headphones and earbuds are "Audio Components", NOT "Audio Accessories"
-- "Audio Accessories" is for cases, cables, stands - not the audio devices themselves
+// Recorded on every cached row. Bump when a change alters answers, so rows made
+// by an older mapper can be found and re-mapped.
+export const MAPPER_VERSION = '2026-10-25';
 
-Select the category that best matches the product.`;
+// Provisional bands on the final comparison's probability, set from a 100-row
+// pilot. Recalibrate against owner-written labels before relying on them.
+const HIGH_SCORE = 0.9;
+const MEDIUM_SCORE = 0.75;
 
-export interface MappingResult {
-  node_id: string;
-  confidence: 'high' | 'medium' | 'low';
-  full_name: string;
+/** What a caller knows about an item. Field names follow relo's Keepa product_data. */
+export interface ItemInput {
+  asin?: string;
+  title?: string;
+  brand?: string;
+  features?: string[];
+  product_group?: string;
+  /** Amazon category path, e.g. "Home & Kitchen > Kitchen & Dining > ...". */
+  category_path?: string;
+}
+
+export interface MappingResult extends StoredMapping {
   cached: boolean;
-  turns?: number;
-  /** True when navigation exhausted MAX_BACKTRACKS without reaching a leaf.
-   * The returned node_id/full_name will be the deepest reached (often a
-   * top-level vertical). Callers should treat as "needs manual review" rather
-   * than a confident mapping. */
-  unmapped?: boolean;
+  /** True when the pick is Shopify's Uncategorized node. */
+  unmapped: boolean;
+  /** Geometric mean of the edge probabilities along the pick's path. Only on
+   * fresh beam results; kept for calibration work, not returned by the API. */
+  path_score?: number;
+  /** Jev requests made. 0 when cached. */
+  turns: number;
+}
+
+interface BeamPath {
+  node: Category | null;
+  logProbability: number;
+  decisions: number;
+  /** True when the model chose to stop here rather than descend. */
+  stopped: boolean;
+}
+
+interface Candidate {
+  node: Category;
+  /** Null for keyword-search hits, which weren't reached by the walk. */
+  pathScore: number | null;
+  source: 'beam' | 'keyword';
+}
+
+/** Length-normalized so shallow and deep paths compare fairly. */
+function pathScore(path: BeamPath): number {
+  return path.decisions ? Math.exp(path.logProbability / path.decisions) : 1;
+}
+
+function byPathScore(a: BeamPath, b: BeamPath): number {
+  return pathScore(b) - pathScore(a);
+}
+
+function confidenceFor(score: number): Confidence {
+  if (score >= HIGH_SCORE) return 'high';
+  if (score >= MEDIUM_SCORE) return 'medium';
+  return 'low';
+}
+
+function stopOptionName(node: Category): string {
+  return `None of these: ${node.name} in general`;
+}
+
+function hasText(value: string | undefined): value is string {
+  return value !== undefined && value.trim() !== '';
 }
 
 /**
- * Hierarchical category mapper using Nova Lite with multi-turn drill-down
+ * Cache key for an item. A product is keyed by ASIN when it has one. Without
+ * one, title-only and category-only keys match the rows written by the old
+ * map-product and map-category endpoints.
+ */
+export function cacheKeyFor(item: ItemInput): string {
+  if (hasText(item.asin)) return `asin:${item.asin.trim()}`;
+  if (hasText(item.title)) return hasText(item.category_path) ? `${item.title} @ ${item.category_path}` : item.title;
+  if (hasText(item.category_path)) return item.category_path;
+  throw new Error('Item needs a title or a category path');
+}
+
+/** The `state` Jev reads. A listing with a title is described by every field it has. */
+function stateFor(item: ItemInput): Record<string, unknown> {
+  if (!hasText(item.title)) {
+    return { item: { kind: 'Amazon category path', text: item.category_path } };
+  }
+  const listing: Record<string, unknown> = { kind: 'Amazon product listing', title: item.title };
+  if (hasText(item.brand)) listing.brand = item.brand;
+  if (hasText(item.product_group)) listing.product_group = item.product_group;
+  if (hasText(item.category_path)) listing.amazon_category = item.category_path;
+  const features = (item.features ?? []).filter(hasText).slice(0, FEATURE_LIMIT)
+    .map(f => (f.length > FEATURE_CHARS ? `${f.slice(0, FEATURE_CHARS)}…` : f));
+  if (features.length > 0) listing.features = features;
+  return { item: listing };
+}
+
+/** Words for keyword search. Amazon paths: the last two segments say what the
+ * item is; department names mislead. */
+function keywordQueryFor(item: ItemInput): string {
+  const tail = hasText(item.category_path) ? item.category_path.split(' > ').slice(-2).join(' ') : '';
+  return [item.title ?? '', tail].join(' ').trim();
+}
+
+/**
+ * Maps inputs onto the Shopify taxonomy with Jev choice questions:
+ *
+ * 1. Beam search. Each open path asks "which child of this node?" (all paths at
+ *    a level in one request). From MIN_STOP_LEVEL down, "stay at this node" is
+ *    also an option, so a general input can end on a non-leaf category.
+ * 2. Finished paths (leaves, or stops) leave the beam for a pool instead of
+ *    competing with longer open paths. Path-score averaging otherwise lets a run
+ *    of middling steps push out a short correct path with one hard step.
+ * 3. The best POOL_SIZE finished categories, plus KEYWORD_CANDIDATES keyword-search
+ *    hits, are compared by full name in one final question (asked in both option
+ *    orders and averaged). The winner's probability is the result's score.
  */
 export class HierarchicalMapper {
-  private nova: NovaLiteClient;
+  private jev: JevClient;
   private taxonomy: TaxonomyLoader;
   private cache: MappingCache;
-  // Cached vertical option list. Static for the process lifetime once taxonomy is loaded.
-  private verticalOptionsCache: ReadonlyArray<{ name: string; isLeaf: boolean; childNames: string[] }> | null = null;
 
-  constructor(taxonomy: TaxonomyLoader, cache: MappingCache, nova?: NovaLiteClient) {
-    this.nova = nova ?? new NovaLiteClient();
+  constructor(taxonomy: TaxonomyLoader, cache: MappingCache, jev?: JevClient) {
+    this.jev = jev ?? new JevClient();
     this.taxonomy = taxonomy;
     this.cache = cache;
   }
 
   mapCategory(categoryPath: string): Promise<MappingResult> {
-    return this.map(categoryPath);
+    return this.mapItem({ category_path: categoryPath });
   }
 
   mapProduct(productTitle: string): Promise<MappingResult> {
-    return this.map(productTitle);
-  }
-
-  private async map(input: string): Promise<MappingResult> {
-    const startTime = Date.now();
-
-    const cached = await this.cache.getHierarchicalMapping(input);
-    if (cached) {
-      console.log(`[CACHE HIT] ${input} -> ${cached.full_name} (${Date.now() - startTime}ms)`);
-      return { ...cached, cached: true };
-    }
-
-    console.log(`[MAPPING] "${input}"`);
-    const result = await this.performGuidedNavigation(input);
-
-    const totalTime = Date.now() - startTime;
-    console.log(`[COMPLETE] ${input} -> ${result.full_name}${result.unmapped ? ' (UNMAPPED)' : ''}`);
-    console.log(`  ├─ Turns: ${result.turns}`);
-    console.log(`  ├─ Confidence: ${result.confidence}`);
-    console.log(`  └─ Time: ${totalTime}ms (${Math.round(totalTime / (result.turns || 1))}ms/turn)`);
-
-    // Don't cache unmapped results — future retries with cleared state may succeed.
-    if (!result.unmapped) {
-      await this.cache.saveHierarchicalMapping(input, result.node_id, result.confidence, result.full_name);
-    }
-    return { ...result, cached: false };
-  }
-
-  private getVerticalOptions(): ReadonlyArray<{ name: string; isLeaf: boolean; childNames: string[] }> {
-    if (!this.verticalOptionsCache) {
-      this.verticalOptionsCache = this.taxonomy.getVerticals().map(v => {
-        const children = v.rootCategory ? this.taxonomy.getChildren(v.rootCategory.id) : [];
-        return { name: v.name, isLeaf: false, childNames: children.map(c => c.name) };
-      });
-    }
-    return this.verticalOptionsCache;
-  }
-
-  /**
-   * Perform guided navigation through taxonomy with backtracking support
-   */
-  private async performGuidedNavigation(query: string): Promise<Omit<MappingResult, 'cached'>> {
-    this.nova.resetConversation();
-
-    const MAX_BACKTRACKS = 5;
-    let backtrackCount = 0;
-    let turnCount = 0;
-
-    let minConfidence: 'high' | 'medium' | 'low' = 'high';
-    const updateMinConfidence = (conf: 'high' | 'medium' | 'low') => {
-      if (conf === 'low') {
-        minConfidence = 'low';
-      } else if (conf === 'medium' && minConfidence === 'high') {
-        minConfidence = 'medium';
-      }
-    };
-
-    interface NavState {
-      categoryId: string;
-      categoryName: string;
-      triedChildren: Set<string>;
-    }
-    const navStack: NavState[] = [];
-    const navigationPath: string[] = [];
-
-    const verticals = this.taxonomy.getVerticals();
-    const triedVerticals = new Set<string>();
-    const allVerticalOptions = this.getVerticalOptions();
-    const verticalOptionsExcluding = (tried: Set<string>) =>
-      allVerticalOptions.filter(o => !tried.has(o.name));
-
-    console.log(`  [Turn ${++turnCount}] Selecting top-level vertical...`);
-    const verticalResult = await this.askForSelection(query, [...allVerticalOptions], []);
-
-    const vertical = verticals.find(v => v.name === verticalResult.category);
-    if (!vertical || !vertical.rootCategory) {
-      throw new Error(`Could not find vertical: ${verticalResult.category}`);
-    }
-
-    updateMinConfidence(verticalResult.confidence);
-    triedVerticals.add(verticalResult.category);
-    navigationPath.push(verticalResult.category);
-    console.log(`    └─ Selected: ${verticalResult.category}`);
-
-    navStack.push({
-      categoryId: vertical.rootCategory.id,
-      categoryName: verticalResult.category,
-      triedChildren: new Set(),
-    });
-
-    // Pop the current node off both stacks, bump backtrackCount. Returns a final
-    // mapping if MAX_BACKTRACKS is exceeded, reselects a vertical if the stack
-    // empties, or null to continue navigating from the new top.
-    const tryBacktrack = async (logMessage: string): Promise<Omit<MappingResult, 'cached'> | null> => {
-      console.log(logMessage);
-      navStack.pop();
-      navigationPath.pop();
-      backtrackCount++;
-      if (backtrackCount > MAX_BACKTRACKS) {
-        const deepest = navStack.length > 0
-          ? this.taxonomy.getCategory(navStack[navStack.length - 1].categoryId)
-          : vertical.rootCategory;
-        if (deepest) {
-          return {
-            node_id: stripGid(deepest.id),
-            confidence: 'low',
-            full_name: deepest.full_name,
-            turns: turnCount,
-            unmapped: true,
-          };
-        }
-      }
-      if (navStack.length === 0) {
-        return reselectOrExhaust();
-      }
-      return null;
-    };
-
-    // Re-pick a top-level vertical after navStack empties. Returns a final mapping
-    // when every vertical has been tried, or null when a fresh vertical was pushed.
-    const reselectOrExhaust = async (): Promise<Omit<MappingResult, 'cached'> | null> => {
-      const available = verticalOptionsExcluding(triedVerticals);
-      if (available.length === 0) {
-        return {
-          node_id: stripGid(vertical.rootCategory!.id),
-          confidence: 'low',
-          full_name: vertical.rootCategory!.full_name,
-          turns: turnCount,
-          unmapped: true,
-        };
-      }
-      console.log(`  [Turn ${++turnCount}] Re-selecting top-level vertical (excluding ${triedVerticals.size} tried)...`);
-      const result = await this.askForSelection(query, available, []);
-      const newV = verticals.find(v => v.name === result.category);
-      if (!newV || !newV.rootCategory) {
-        throw new Error(`Could not find vertical: ${result.category}`);
-      }
-      updateMinConfidence(result.confidence);
-      triedVerticals.add(result.category);
-      navigationPath.length = 0;
-      navigationPath.push(result.category);
-      console.log(`    └─ Selected: ${result.category}`);
-      navStack.push({
-        categoryId: newV.rootCategory.id,
-        categoryName: result.category,
-        triedChildren: new Set(),
-      });
-      return null;
-    };
-
-    while (navStack.length > 0) {
-      const current = navStack[navStack.length - 1];
-      const category = this.taxonomy.getCategory(current.categoryId);
-      if (!category) {
-        navStack.pop();
-        continue;
-      }
-
-      if (category.children.length === 0) {
-        // Any backtrack collapses confidence to low even if every individual turn was high.
-        const finalConfidence = backtrackCount > 0 ? 'low' : minConfidence;
-        return {
-          node_id: stripGid(category.id),
-          confidence: finalConfidence,
-          full_name: category.full_name,
-          turns: turnCount,
-        };
-      }
-
-      const allChildren = this.taxonomy.getChildren(current.categoryId);
-      const availableChildren = allChildren.filter(c => !current.triedChildren.has(c.name));
-
-      if (availableChildren.length === 0) {
-        const result = await tryBacktrack(`  [Backtrack] No more options at "${category.name}", going back...`);
-        if (result) return result;
-        continue;
-      }
-
-      console.log(`  [Turn ${++turnCount}] Selecting from ${availableChildren.length} children of "${category.name}"...`);
-
-      const childOptions = availableChildren.map(c => {
-        const grandchildren = this.taxonomy.getChildren(c.id);
-        return {
-          name: c.name,
-          isLeaf: c.children.length === 0,
-          childNames: grandchildren.map(gc => gc.name),
-        };
-      });
-
-      const canGoBack = navStack.length > 1 || triedVerticals.size < verticals.length;
-      if (canGoBack) {
-        childOptions.push({
-          name: 'None of these match',
-          isLeaf: false,
-          childNames: [],
-        });
-      }
-
-      const childResult = await this.askForSelection(
-        query,
-        childOptions,
-        navigationPath,
-      );
-
-      if (childResult.category === 'None of these match') {
-        const abandoned = navStack[navStack.length - 1];
-        const result = await tryBacktrack(`    └─ No match found, backtracking from "${abandoned.categoryName}"...`);
-        if (result) return result;
-        continue;
-      }
-
-      updateMinConfidence(childResult.confidence);
-
-      const child = allChildren.find(c => c.name === childResult.category);
-      if (!child) {
-        console.error(`    └─ Available children: ${availableChildren.map(c => `"${c.name}"`).join(', ')}`);
-        throw new Error(`Could not find child category: "${childResult.category}"`);
-      }
-
-      current.triedChildren.add(child.name);
-      navigationPath.push(child.name);
-      console.log(`    └─ Selected: ${child.name}${child.children.length === 0 ? ' (LEAF)' : ''}`);
-
-      navStack.push({
-        categoryId: child.id,
-        categoryName: child.name,
-        triedChildren: new Set(),
-      });
-    }
-
-    throw new Error('Navigation ended without reaching a leaf category');
+    return this.mapItem({ title: productTitle });
   }
 
   getModelId(): string {
-    return this.nova.getModelId();
+    return this.jev.getModelId();
   }
 
-  private async askForSelection(
-    query: string,
-    options: Array<{ name: string; isLeaf: boolean; childNames?: string[] }>,
-    currentPath: string[],
-  ): Promise<{ category: string; confidence: 'high' | 'medium' | 'low' }> {
-    const turnStartTime = Date.now();
+  async mapItem(item: ItemInput): Promise<MappingResult> {
+    const startTime = Date.now();
+    const key = cacheKeyFor(item);
 
-    const schema = {
-      type: 'object',
-      properties: {
-        category: {
-          type: 'string',
-          enum: options.map(o => o.name),
-          description: 'The selected category (must exactly match one option)',
-        },
-        confidence: {
-          type: 'string',
-          enum: ['high', 'medium', 'low'],
-          description: 'How certain: high=clear match, medium=reasonable, low=uncertain',
-        },
-      },
-      required: ['category', 'confidence'],
+    const cached = this.cache.get(key);
+    if (cached) {
+      console.log(`[CACHE HIT] ${key} -> ${cached.full_name} (${cached.source}, ${Date.now() - startTime}ms)`);
+      return { ...cached, cached: true, unmapped: cached.node_id === UNCATEGORIZED_ID, turns: 0 };
+    }
+
+    console.log(`[MAPPING] "${key}"`);
+    const result = await this.classify(item);
+
+    const totalTime = Date.now() - startTime;
+    console.log(`[COMPLETE] ${key} -> ${result.full_name}`);
+    console.log(`  ├─ Turns: ${result.turns}`);
+    console.log(`  ├─ Score: ${result.score?.toFixed(3)} (${result.confidence}), path ${result.path_score?.toFixed(3)}`);
+    console.log(`  └─ Time: ${totalTime}ms`);
+
+    this.cache.save(key, result);
+    return result;
+  }
+
+  /**
+   * Record a person's correction. It replaces the cached answer for this item
+   * (so it is served from now on) and is logged as a label for evaluation.
+   */
+  correct(item: ItemInput, nodeId: string): { input_key: string; previous_node_id: string | null; mapping: StoredMapping } {
+    const category = this.taxonomy.getCategory(nodeId);
+    if (!category) throw new Error(`Unknown category: ${nodeId}`);
+    const key = cacheKeyFor(item);
+    const previous = this.cache.get(key)?.node_id ?? null;
+    const mapping: StoredMapping = {
+      node_id: stripGid(category.id),
+      full_name: category.full_name,
+      confidence: 'high',
+      score: null,
+      alternatives: [],
+      source: 'manual',
+      model: null,
+      mapper_version: null,
     };
+    this.cache.save(key, mapping);
+    this.cache.recordFeedback(key, mapping.node_id, previous, item);
+    console.log(`[CORRECTION] ${key}: ${previous ?? '(none)'} -> ${mapping.node_id}`);
+    return { input_key: key, previous_node_id: previous, mapping };
+  }
 
-    const optionsList = options.map((o, i) => {
-      if (o.isLeaf || !o.childNames || o.childNames.length === 0) {
-        return `${i + 1}. ${o.name}`;
-      }
-      const childList = o.childNames.slice(0, 5).join(', ') + (o.childNames.length > 5 ? '...' : '');
-      return `${i + 1}. ${o.name}\n   → includes: ${childList}`;
-    }).join('\n');
+  private childrenOf(node: Category | null): Category[] {
+    if (node) return this.taxonomy.getChildren(node.id);
+    return this.taxonomy.getVerticals()
+      .map(v => v.rootCategory)
+      .filter((c): c is Category => c !== undefined);
+  }
 
-    const pathContext = currentPath.length > 0
-      ? `\nPath: ${currentPath.join(' > ')}`
-      : '';
+  private canStopAt(node: Category | null): node is Category {
+    return node !== null && node.level >= MIN_STOP_LEVEL;
+  }
 
-    // Reverted to prod's single-block prompt (no cachePoint). Splitting into a
-    // cacheable prefix changed the model's attention pattern and caused bail-outs.
-    const prompt = `Product: "${query}"${pathContext}
+  private async ask(state: Record<string, unknown>, questions: Record<string, ChoiceQuestion>, turn: number): Promise<Record<string, ChoiceAnswer>> {
+    const turnStart = Date.now();
+    const { answers } = await this.jev.decide(state, questions);
+    console.log(`  [Turn ${turn}] ${Object.keys(questions).length} question(s): ${Date.now() - turnStart}ms`);
+    return answers;
+  }
 
-Which category? (Select from the numbered options, not the examples in parentheses)
-${optionsList}`;
+  private async classify(item: ItemInput): Promise<MappingResult> {
+    const state = stateFor(item);
+    let beam: BeamPath[] = [{ node: null, logProbability: 0, decisions: 0, stopped: false }];
+    const finished: BeamPath[] = [];
+    let turns = 0;
 
-    // Each turn is stateless: we re-emit the full context every call. resetConversation
-    // avoids the SDK requiring tool-result continuity from prior turns.
-    this.nova.resetConversation();
-
-    const response = await this.nova.converse(prompt, {
-      systemPrompt: TAXONOMY_SYSTEM_PROMPT,
-      jsonSchema: schema,
-    });
-
-    const turnTime = Date.now() - turnStartTime;
-    console.log(`    └─ Turn complete: ${turnTime}ms`);
-
-    if (response.text) {
-      console.log(`    └─ Raw response: ${response.text.substring(0, 200)}`);
-    }
-
-    if (!response.structuredOutput || !('category' in response.structuredOutput)) {
-      console.error('    └─ No structured output. Response:', JSON.stringify(response, null, 2));
-      throw new Error('No structured response received from Nova');
-    }
-
-    const selectedCategory = response.structuredOutput.category as string;
-    const confidence = (response.structuredOutput.confidence as 'high' | 'medium' | 'low') || 'medium';
-    console.log(`    └─ LLM selected: "${selectedCategory}" (confidence: ${confidence})`);
-
-    const validOptionNames = options.map(o => o.name);
-    if (!validOptionNames.includes(selectedCategory)) {
-      console.error(`    └─ ERROR: "${selectedCategory}" is not a valid option!`);
-      console.error(`    └─ Valid options: ${validOptionNames.join(', ')}`);
-
-      // Models sometimes emit a child-hint name instead of the parent option. Recover.
-      for (const opt of options) {
-        if (opt.childNames?.includes(selectedCategory)) {
-          console.log(`    └─ "${selectedCategory}" is a child of "${opt.name}", selecting parent instead`);
-          return { category: opt.name, confidence: 'medium' };
+    for (let depth = 0; depth < MAX_DEPTH && beam.length > 0; depth++) {
+      const questions: Record<string, ChoiceQuestion> = {};
+      beam.forEach((path, i) => {
+        const options = this.childrenOf(path.node);
+        // A lone child with no stop option is not a decision; skip the question.
+        if (options.length > 1 || this.canStopAt(path.node)) {
+          questions[`q${i}`] = this.buildQuestion(path.node, options);
         }
-      }
+      });
+      const answers = Object.keys(questions).length > 0 ? await this.ask(state, questions, ++turns) : {};
 
-      throw new Error(`Model returned invalid category "${selectedCategory}" not in options: ${validOptionNames.join(', ')}`);
+      const expanded: BeamPath[] = [];
+      beam.forEach((path, i) => {
+        const options = this.childrenOf(path.node);
+        const answer = answers[`q${i}`];
+        if (!answer) {
+          expanded.push({ ...path, node: options[0] });
+          return;
+        }
+        const extend = (node: Category | null, name: string, stopped: boolean): BeamPath => ({
+          node,
+          logProbability: path.logProbability + Math.log(Math.max(answer.probabilities[name] ?? 0, MIN_PROBABILITY)),
+          decisions: path.decisions + 1,
+          stopped,
+        });
+        for (const option of options) expanded.push(extend(option, option.name, false));
+        if (this.canStopAt(path.node)) expanded.push(extend(path.node, stopOptionName(path.node), true));
+      });
+
+      const isFinished = (p: BeamPath) => p.stopped || this.childrenOf(p.node).length === 0;
+      finished.push(...expanded.filter(isFinished));
+      beam = expanded.filter(p => !isFinished(p)).sort(byPathScore).slice(0, BEAM_WIDTH);
+      if (beam.length > 0) {
+        console.log(`    └─ Leading open path: ${beam[0].node?.full_name} (${pathScore(beam[0]).toFixed(3)})`);
+      }
     }
 
-    return { category: selectedCategory, confidence };
+    // The same node can finish twice (reached as a leaf on one path, stopped at
+    // on another); keep its best path.
+    const candidates: Candidate[] = [];
+    const addCandidate = (candidate: Candidate) => {
+      if (!candidates.some(c => c.node.id === candidate.node.id)) candidates.push(candidate);
+    };
+    for (const path of finished.sort(byPathScore)) {
+      if (candidates.length === POOL_SIZE) break;
+      if (path.node) addCandidate({ node: path.node, pathScore: pathScore(path), source: 'beam' });
+    }
+    // Keyword hits reach categories the walk pruned early, e.g. "Smart Watches"
+    // under Apparel & Accessories > Jewelry for an Electronics-looking title.
+    for (const node of this.taxonomy.keywordSearch(keywordQueryFor(item), KEYWORD_CANDIDATES)) {
+      addCandidate({ node, pathScore: null, source: 'keyword' });
+    }
+    if (candidates.length === 0) {
+      throw new Error('Beam search ended without reaching a category');
+    }
+
+    // Every candidate with its probability, best first. A lone candidate is certain.
+    let ranked: Array<{ candidate: Candidate; probability: number }> = [{ candidate: candidates[0], probability: 1 }];
+    if (candidates.length > 1) {
+      // Asked in both orders and averaged, to cancel Jev's lean toward the first option.
+      const answers = await this.ask(state, {
+        forward: this.buildFinalQuestion(candidates),
+        reversed: this.buildFinalQuestion([...candidates].reverse()),
+      }, ++turns);
+      ranked = candidates
+        .map(c => ({
+          candidate: c,
+          probability: ((answers.forward.probabilities[c.node.full_name] ?? 0) + (answers.reversed.probabilities[c.node.full_name] ?? 0)) / 2,
+        }))
+        .sort((a, b) => b.probability - a.probability);
+    }
+    const { candidate: chosen, probability: score } = ranked[0];
+    console.log(`    └─ Final pick: ${chosen.node.full_name} (${score.toFixed(3)} of ${candidates.length} candidates, ${chosen.source})`);
+
+    const alternatives: Alternative[] = ranked.slice(1, 1 + ALTERNATIVE_COUNT).map(r => ({
+      node_id: stripGid(r.candidate.node.id),
+      full_name: r.candidate.node.full_name,
+      score: r.probability,
+    }));
+    const nodeId = stripGid(chosen.node.id);
+    return {
+      node_id: nodeId,
+      full_name: chosen.node.full_name,
+      confidence: confidenceFor(score),
+      score,
+      alternatives,
+      source: 'jev',
+      model: this.jev.getModelId(),
+      mapper_version: MAPPER_VERSION,
+      cached: false,
+      unmapped: nodeId === UNCATEGORIZED_ID,
+      path_score: chosen.pathScore ?? undefined,
+      turns,
+    };
+  }
+
+  private buildQuestion(parent: Category | null, options: Category[]): ChoiceQuestion {
+    const criteria: Record<string, Criterion> = {};
+    for (const option of options) {
+      const grandchildren = this.taxonomy.getChildren(option.id).map(c => c.name);
+      criteria[option.name] = grandchildren.length > 0
+        ? { what: option.name, includes: grandchildren.slice(0, HINT_COUNT) }
+        : option.name;
+    }
+    if (this.canStopAt(parent)) {
+      criteria[stopOptionName(parent)] = `The item belongs in "${parent.full_name}" but none of the other options describes it specifically, or the item is too general to tell which one.`;
+    }
+    const scope = parent ? `subcategory of "${parent.full_name}"` : 'top-level product category';
+    return {
+      type: 'choice',
+      instructions: `Which ${scope} best fits the item described in \`item\`? \`item.kind\` says whether it is an Amazon category path or a product listing title.`,
+      criteria,
+    };
+  }
+
+  /** Options are full category paths, in the order given. */
+  private buildFinalQuestion(candidates: Candidate[]): ChoiceQuestion {
+    const criteria: Record<string, Criterion> = {};
+    for (const c of candidates) criteria[c.node.full_name] = c.node.full_name;
+    return {
+      type: 'choice',
+      instructions: 'Which Shopify category is the most accurate for the item described in `item`? Prefer the most specific category that is still correct.',
+      criteria,
+    };
   }
 }

@@ -1,32 +1,27 @@
 {
   "name": "shopify-taxonomy-mapper",
   "version": "1.0.0",
-  "description": "HTTP API for mapping Amazon categories and product titles to Shopify's official taxonomy using Amazon Nova Lite",
+  "description": "HTTP API for mapping Amazon categories and product titles to Shopify's official taxonomy using TypeSafe Jev",
   "type": "module",
-  "main": "dist/server.js",
+  "main": "src/server.ts",
   "scripts": {
-    "build": "tsc",
-    "watch": "tsc --watch",
-    "dev": "bun run build && bun --watch src/server.ts",
-    "start": "bun run build && bun src/server.ts",
+    "dev": "bun --watch src/server.ts",
+    "start": "bun src/server.ts",
     "lint": "eslint src --ext .ts --fix",
-    "type-check": "tsc --noEmit",
-    "eval": "bun eval/eval-models.ts",
-    "measure-cache": "bun eval/measure-cache.ts"
+    "type-check": "tsc",
+    "eval": "bun eval/iterate.ts",
+    "compare": "bun eval/compare-cache.ts"
   },
   "keywords": [
     "shopify",
     "taxonomy",
     "category-mapping",
     "amazon",
-    "nova-lite",
+    "jev",
     "api"
   ],
   "author": "",
   "license": "MIT",
-  "dependencies": {
-    "@aws-sdk/client-bedrock-runtime": "^3.1041.0"
-  },
   "devDependencies": {
     "@types/bun": "^1.3.13",
     "@types/node": "^22.19.17",
@@ -34,8 +29,5 @@
     "@typescript-eslint/parser": "^8.59.2",
     "eslint": "^9.39.4",
     "typescript": "^5.9.3"
-  },
-  "engines": {
-    "node": ">=18.0.0"
   }
 }

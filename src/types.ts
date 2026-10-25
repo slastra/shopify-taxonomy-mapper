@@ -24,18 +24,24 @@ export interface TaxonomyData {
   verticals: Vertical[];
 }
 
-export interface SearchResult {
-  category: Category;
+export type Confidence = 'high' | 'medium' | 'low';
+
+/** A runner-up category from the final comparison. */
+export interface Alternative {
+  node_id: string;
+  full_name: string;
   score: number;
-  matchType: 'exact' | 'partial' | 'fuzzy';
 }
 
-export interface CategoryMapping {
-  amazon_category: string;
-  shopify_category_id: string;
-  shopify_category_gid: string;
-  shopify_full_name: string;
-  confidence: 'high' | 'medium' | 'low';
-  created_by: 'llm' | 'manual';
-  created_at: Date;
+/** A mapping as stored in (and read back from) the result cache. */
+export interface StoredMapping {
+  node_id: string;
+  full_name: string;
+  confidence: Confidence;
+  score: number | null;
+  alternatives: Alternative[];
+  /** llm: Nova-era row; jev: computed by the mapper; manual: a person's correction. */
+  source: 'llm' | 'jev' | 'manual';
+  model: string | null;
+  mapper_version: string | null;
 }

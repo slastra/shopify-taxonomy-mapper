@@ -1,13 +1,32 @@
 import { readFile } from 'fs/promises';
 import { join } from 'path';
-import type { TaxonomyData, Category, SearchResult } from './types.js';
+import type { TaxonomyData, Category } from './types.js';
 import { stripGid, toGid } from './ids.js';
+
+// Words that carry no category meaning in names or listings.
+const KEYWORD_STOPWORDS = new Set([
+  'and', 'for', 'the', 'with', 'of', 'in', 'to', 'pack', 'oz', 'set', 'other',
+  'accessory', 'accessories', 'supply', 'supplies', 'product',
+]);
+const BM25_K1 = 1.2;
+const BM25_B = 0.75;
+
+/** Lowercase word tokens with light plural folding ("watches" → "watch", "batteries" → "battery"). */
+function keywordTokens(text: string): string[] {
+  return text.toLowerCase().replace(/&/g, ' ').split(/[^a-z0-9]+/)
+    .filter(w => w.length > 1)
+    .map(w => w.replace(/ies$/, 'y').replace(/(ch|sh|x|ss|z)es$/, '$1').replace(/(?<![su])s$/, ''))
+    .filter(w => !KEYWORD_STOPWORDS.has(w));
+}
 
 export class TaxonomyLoader {
   private data: TaxonomyData | null = null;
   private categoryIndex: Map<string, Category> = new Map();
-  private nameIndex: Map<string, Category[]> = new Map();
   private totalCategoryCount = 0;
+  // BM25 index over category names, for keywordSearch().
+  private keywordDocs: Array<{ category: Category; tokens: string[] }> = [];
+  private keywordDocFrequency: Map<string, number> = new Map();
+  private keywordAvgLength = 0;
 
   async load(dataPath: string = '../data/categories.json'): Promise<void> {
     const fullPath = join(import.meta.dirname, dataPath);
@@ -24,14 +43,40 @@ export class TaxonomyLoader {
         this.categoryIndex.set(category.id, category);
         this.categoryIndex.set(stripGid(category.id), category);
 
-        const nameLower = category.name.toLowerCase();
-        const fullNameLower = category.full_name.toLowerCase();
-        (this.nameIndex.get(nameLower) ?? this.nameIndex.set(nameLower, []).get(nameLower)!).push(category);
-        if (fullNameLower !== nameLower) {
-          (this.nameIndex.get(fullNameLower) ?? this.nameIndex.set(fullNameLower, []).get(fullNameLower)!).push(category);
+        const tokens = keywordTokens(category.name);
+        this.keywordDocs.push({ category, tokens });
+        for (const token of new Set(tokens)) {
+          this.keywordDocFrequency.set(token, (this.keywordDocFrequency.get(token) ?? 0) + 1);
         }
       }
     }
+    this.keywordAvgLength = this.keywordDocs.reduce((sum, d) => sum + d.tokens.length, 0) / (this.keywordDocs.length || 1);
+  }
+
+  /**
+   * BM25 ranking of categories whose names share words with `text`. Matches
+   * individual words, so it works on long listing titles as well as short
+   * queries. Ties prefer deeper (more specific) categories.
+   */
+  keywordSearch(text: string, limit: number): Category[] {
+    const queryTokens = [...new Set(keywordTokens(text))];
+    if (queryTokens.length === 0) return [];
+    const docCount = this.keywordDocs.length;
+
+    const scored: Array<{ category: Category; score: number }> = [];
+    for (const { category, tokens } of this.keywordDocs) {
+      let score = 0;
+      for (const token of queryTokens) {
+        const tf = tokens.filter(t => t === token).length;
+        if (tf === 0) continue;
+        const df = this.keywordDocFrequency.get(token) ?? 0;
+        const idf = Math.log(1 + (docCount - df + 0.5) / (df + 0.5));
+        score += idf * (tf * (BM25_K1 + 1)) / (tf + BM25_K1 * (1 - BM25_B + BM25_B * tokens.length / this.keywordAvgLength));
+      }
+      if (score > 0) scored.push({ category, score });
+    }
+    scored.sort((a, b) => b.score - a.score || b.category.level - a.category.level);
+    return scored.slice(0, limit).map(s => s.category);
   }
 
   getCategory(id: string): Category | undefined {
@@ -53,37 +98,6 @@ export class TaxonomyLoader {
     return category.children
       .map(child => this.getCategory(child.id))
       .filter((c): c is Category => c !== undefined);
-  }
-
-  search(query: string, limit: number = 10): SearchResult[] {
-    if (!this.data || !query) return [];
-
-    const queryLower = query.toLowerCase().trim();
-    const results: SearchResult[] = [];
-
-    for (const category of this.nameIndex.get(queryLower) || []) {
-      results.push({ category, score: 100, matchType: 'exact' });
-    }
-
-    for (const vertical of this.data.verticals) {
-      for (const category of vertical.categories) {
-        const nameLower = category.name.toLowerCase();
-        const fullNameLower = category.full_name.toLowerCase();
-        if (!nameLower.includes(queryLower) && !fullNameLower.includes(queryLower)) continue;
-        if (results.some(r => r.category.id === category.id)) continue;
-
-        let score = 50;
-        if (nameLower.startsWith(queryLower)) score = 80;
-        if (fullNameLower.includes(` > ${queryLower}`)) score = 70;
-        if (fullNameLower.endsWith(queryLower)) score = 75;
-
-        results.push({ category, score, matchType: 'partial' });
-      }
-    }
-
-    // Higher score first, deeper categories preferred on ties (more specific match).
-    results.sort((a, b) => b.score - a.score || b.category.level - a.category.level);
-    return results.slice(0, limit);
   }
 
   getVersion(): string {

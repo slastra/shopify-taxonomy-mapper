@@ -1,13 +1,13 @@
 /**
- * In-process prompt iteration harness.
+ * In-process accuracy harness for the Jev beam search.
  *
  * Runs the 20 adjudicated test cases through HierarchicalMapper directly
  * (no HTTP, no server restart). Scores each result against the case's `right`
  * and `acceptable` patterns. Prints per-case verdicts plus aggregate accuracy,
- * turn count, and latency.
+ * turn count, latency, and Jev spend.
  *
  * Use:
- *   bun eval/iterate.ts
+ *   bun run eval
  *
  * Iterate by editing src/hierarchical-mapper.ts and re-running.
  */
@@ -15,8 +15,7 @@
 import { TaxonomyLoader } from '../src/taxonomy-loader.js';
 import { MappingCache } from '../src/database.js';
 import { HierarchicalMapper } from '../src/hierarchical-mapper.js';
-import { NovaLiteClient } from '../src/nova-client.js';
-import { trackTokens } from './instrument.js';
+import { CountingJevClient } from './counting-client.js';
 import { TEST_CASES, type TestCase } from './test-cases.js';
 import { errMessage } from '../src/errors.js';
 import { rmSync } from 'fs';
@@ -29,8 +28,7 @@ rmSync(dbPath, { force: true });
 const cache = new MappingCache();
 cache.connect(dbPath);
 
-const client = new NovaLiteClient();
-const { turns, reset: resetTurns } = trackTokens(client);
+const client = new CountingJevClient();
 const mapper = new HierarchicalMapper(taxonomy, cache, client);
 
 // Silence per-turn mapper logs; keep summary output clean.
@@ -44,10 +42,8 @@ interface CaseResult {
   verdict: 'right' | 'acceptable' | 'wrong' | 'error';
   ms: number;
   turns: number;
-  inputTokens: number;
-  outputTokens: number;
-  cacheReadTokens: number;
-  cacheWriteTokens: number;
+  score: number | null;
+  cost: number;
   error?: string;
 }
 
@@ -61,32 +57,20 @@ const results: CaseResult[] = [];
 
 try {
   for (const c of TEST_CASES) {
-    resetTurns();
+    client.reset();
     const start = Date.now();
     try {
       const r = c.mode === 'category' ? await mapper.mapCategory(c.input) : await mapper.mapProduct(c.input);
       const ms = Date.now() - start;
       const verdict = adjudicate(c, r.full_name);
-      const totals = turns.reduce(
-        (a, t) => ({
-          input: a.input + t.inputTokens,
-          output: a.output + t.outputTokens,
-          read: a.read + t.cacheReadTokens,
-          write: a.write + t.cacheWriteTokens,
-        }),
-        { input: 0, output: 0, read: 0, write: 0 },
-      );
       results.push({
         case: c, ok: true, full_name: r.full_name, verdict, ms,
-        turns: r.turns ?? turns.length,
-        inputTokens: totals.input, outputTokens: totals.output,
-        cacheReadTokens: totals.read, cacheWriteTokens: totals.write,
+        turns: client.requests, score: r.score, cost: client.cost,
       });
     } catch (e) {
       results.push({
         case: c, ok: false, full_name: '', verdict: 'error',
-        ms: Date.now() - start, turns: turns.length,
-        inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0,
+        ms: Date.now() - start, turns: client.requests, score: null, cost: client.cost,
         error: errMessage(e),
       });
     }
@@ -102,15 +86,16 @@ const VERDICT_GLYPH = { right: '✓', acceptable: '~', wrong: '✗', error: 'E' 
 
 console.log('\nPer-case results:');
 console.log('─'.repeat(140));
-console.log(`${'verdict'.padEnd(8)}${'label'.padEnd(28)}${'turns'.padStart(6)}  ${'ms'.padStart(5)}  result`);
+console.log(`${'verdict'.padEnd(8)}${'label'.padEnd(28)}${'turns'.padStart(6)}  ${'ms'.padStart(5)}  ${'score'.padStart(5)}  result`);
 console.log('─'.repeat(140));
 for (const r of results) {
   const v = VERDICT_GLYPH[r.verdict];
   const label = r.case.label.slice(0, 26).padEnd(28);
   const turnsStr = String(r.turns).padStart(6);
   const msStr = String(r.ms).padStart(5);
+  const scoreStr = (r.score?.toFixed(2) ?? '-').padStart(5);
   const path = (r.full_name || r.error || '').slice(0, 90);
-  console.log(`  ${v}     ${label}${turnsStr}  ${msStr}  ${path}`);
+  console.log(`  ${v}     ${label}${turnsStr}  ${msStr}  ${scoreStr}  ${path}`);
 }
 
 // Aggregate
@@ -123,10 +108,7 @@ const sortedMs = [...results].map(r => r.ms).sort((a, b) => a - b);
 const medianMs = sortedMs[Math.floor(sortedMs.length / 2)];
 const p95Ms = sortedMs[Math.floor(sortedMs.length * 0.95)];
 
-const sumIn = results.reduce((s, r) => s + r.inputTokens, 0);
-const sumOut = results.reduce((s, r) => s + r.outputTokens, 0);
-const sumRead = results.reduce((s, r) => s + r.cacheReadTokens, 0);
-const sumWrite = results.reduce((s, r) => s + r.cacheWriteTokens, 0);
+const totalCost = results.reduce((s, r) => s + r.cost, 0);
 
 console.log('\nAggregate:');
 console.log('─'.repeat(60));
@@ -143,7 +125,7 @@ console.log(`Mean latency:        ${meanMs.toFixed(0)} ms`);
 console.log(`Median latency:      ${medianMs} ms`);
 console.log(`p95 latency:         ${p95Ms} ms`);
 console.log();
-console.log(`Total tokens:        in=${sumIn}  out=${sumOut}  cache_read=${sumRead}  cache_write=${sumWrite}`);
+console.log(`Jev cost:            $${totalCost.toFixed(5)} total, $${(totalCost / results.length).toFixed(5)}/mapping`);
 
 console.log('\nWrong cases (need fixing):');
 for (const r of results.filter(r => r.verdict === 'wrong' || r.verdict === 'error')) {
