@@ -8,7 +8,7 @@ HTTP API that maps Amazon products to Shopify's official product taxonomy using 
 
 **Production URL:** https://stm.revolvetrading.com
 **Tech Stack:** Bun runtime, TypeScript, Jev (OpenRouter), SQLite cache
-**Deployment (2026-10-25):** prod still runs as the systemd unit `shopify-taxonomy-mapper` on the main Coolify box (lastra.us, `/home/shaun/shopify-taxonomy-mapper`, port 3001), behind a hand-written Traefik route `/data/coolify/proxy/dynamic/stm.yaml` → `http://10.0.0.1:3001`. Git push does NOT deploy it. A move into Coolify (main) via `nixpacks.toml` is planned: remove `stm.yaml` at cutover, and stopping the unit needs sudo.
+**Deployment:** Coolify app `slastra/shopify-taxonomy-mapper` on the main instance, built from `Dockerfile`, pinned to `master`. A push to `master` is a production deploy, so confirm first. Persistent volume at `/app/data` (taxonomy + SQLite cache). Health check `GET /health`.
 
 **History:** until 2026-10 this used Bedrock (Nova / Claude Haiku) with multi-turn forced tool use and LLM-driven backtracking. That route is fully abandoned: no AWS SDK, no generative model anywhere. Don't reintroduce one without asking.
 
@@ -139,7 +139,7 @@ shopify-taxonomy-mapper/
 │   ├── counting-client.ts     # JevClient subclass that tallies requests and cost
 │   └── test-cases.ts          # 20 adjudicated real-inventory cases
 ├── data/                      # categories.json + mappings.db (auto-created, not committed)
-├── nixpacks.toml              # Coolify build
+├── Dockerfile                 # Coolify build (oven/bun, runs src/server.ts)
 ├── install-service.sh         # Systemd installer
 └── README.md                  # API documentation
 ```

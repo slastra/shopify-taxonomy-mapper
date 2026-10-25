@@ -203,9 +203,9 @@ eval/
 
 ## Deployment
 
-### Coolify (nixpacks)
+### Coolify (Dockerfile)
 
-`nixpacks.toml` builds with the Bun provider and starts `bun src/server.ts`. Set `OPENROUTER_API_KEY` and `API_ACCESS_TOKEN` in the app's environment.
+The `Dockerfile` builds on the official `oven/bun` image and runs `bun src/server.ts` on port 3001. In Coolify, use the Dockerfile build pack, set `OPENROUTER_API_KEY` and `API_ACCESS_TOKEN`, mount a persistent volume at `/app/data` (taxonomy + cache), and point the health check at `/health`.
 
 ### Systemd
 
